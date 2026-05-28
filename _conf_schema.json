@@ -1,0 +1,17 @@
+{
+  "request_timeout": {
+    "description": "HTTP 请求超时（秒）",
+    "type": "int",
+    "default": 30
+  },
+  "game_check_interval": {
+    "description": "新游戏检查间隔（秒），默认 21600（6小时）",
+    "type": "int",
+    "default": 21600
+  },
+  "max_display_items": {
+    "description": "列表每页最大显示数量",
+    "type": "int",
+    "default": 21
+  }
+}
