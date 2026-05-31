@@ -15,6 +15,8 @@ class GameBrief:
     release_date: str | None = None
     platforms: list[str] = field(default_factory=list)
     modes: list[str] = field(default_factory=list)
+    coop_players: int | None = None
+    multi_players: int | None = None
     views: int | None = None
     comments_info: str | None = None
 

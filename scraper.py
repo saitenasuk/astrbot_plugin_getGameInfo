@@ -169,6 +169,33 @@ class OnlineFixScraper(BaseGameScraper):
         total = self._parse_pagination(soup)
         return games, total
 
+    _PLAYER_CLASS_RE = re.compile(r"^(coop|multi)\d*$")
+
+    async def fetch_player_counts(self, game_url: str) -> tuple[int | None, int | None]:
+        """从游戏详情页解析合作人数和多人人数。
+
+        解析形如 <div class="coop1">КООПЕРАТИВ: 8</div> 的元素，
+        返回 (合作人数, 多人人数)，未找到则为 None。
+        """
+        html = await self._fetch(game_url)
+        soup = BeautifulSoup(html, "lxml")
+        coop = None
+        multi = None
+        for div in soup.find_all("div", class_=self._PLAYER_CLASS_RE):
+            text = div.get_text(strip=True)
+            m = re.search(r"(\d+)", text)
+            if not m:
+                continue
+            count = int(m.group(1))
+            for cls_name in div.get("class", []):
+                if cls_name.startswith("coop"):
+                    coop = count
+                    break
+                elif cls_name.startswith("multi"):
+                    multi = count
+                    break
+        return coop, multi
+
     # ---- 内部解析 ----
 
     def _parse_item(self, article: Tag) -> Optional[GameBrief]:

@@ -124,6 +124,15 @@ class GameDownPlugin(Star):
             if g.poster_url:
                 b64_url = await self._prepare_image(g.poster_url, g.title)
 
+            # 从详情页获取玩家人数
+            if g.url:
+                full_url = g.url if g.url.startswith("http") else f"https://online-fix.me{g.url}"
+                try:
+                    g.coop_players, g.multi_players = await self._scraper.fetch_player_counts(full_url)
+                except Exception as e:
+                    logger.warning(f"获取玩家人数失败: {e}")
+                    g.coop_players = g.multi_players = None
+
             group_id = int(event.get_group_id()) if event.get_group_id() else 0
             if group_id == 0:
                 # 私聊：纯文本
@@ -293,6 +302,15 @@ class GameDownPlugin(Star):
         if g.post_date: lines.append(f"网站发布时间：{g.post_date}")
         if g.platforms: lines.append(f"平台：{' / '.join(g.platforms)}")
         if g.modes: lines.append(f"模式：{'、'.join(g.modes)}")
+        # 玩家人数（仅详情页获取后才有值）
+        if g.coop_players is not None or g.multi_players is not None:
+            parts = []
+            if g.coop_players is not None:
+                parts.append(f"合作人数{g.coop_players}")
+            if g.multi_players is not None:
+                parts.append(f"多人人数{g.multi_players}")
+            if parts:
+                lines.append(f"人数：{'、'.join(parts)}")
         if g.update_info: lines.append(f"更新情况：{g.update_info}")
         url = g.url if g.url.startswith("http") else f"https://online-fix.me{g.url}"
         lines.append(f"详情页：{url}")
