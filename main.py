@@ -1,8 +1,13 @@
 """astrbot_plugin_getGameInfo — 游戏插件"""
 
 import asyncio
+import base64
+import io
 import json
 from pathlib import Path
+
+import httpx
+from PIL import Image as PILImage
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -88,7 +93,9 @@ class GameDownPlugin(Star):
         for g in games:
             content = []
             if g.poster_url:
-                content.append({"type": "image", "data": {"file": g.poster_url}})
+                b64_url = await self._prepare_image(g.poster_url, g.title)
+                if b64_url:
+                    content.append({"type": "image", "data": {"file": b64_url}})
             content.append({"type": "text", "data": {"text": self._fmt_card(g)}})
             nodes.append({"type": "node", "data": {"user_id": event.get_self_id(), "nickname": "Online-Fix.me", "content": content}})
 
@@ -96,7 +103,7 @@ class GameDownPlugin(Star):
             await bot.call_action("send_group_forward_msg", group_id=group_id, messages=nodes)
         except Exception as e:
             logger.error(f"合并转发失败: {e}")
-            yield event.plain_result(f"发送失败: {e}")
+            yield event.plain_result("发送失败，请查看日志")
 
     # ---- /game info ----
 
@@ -111,11 +118,40 @@ class GameDownPlugin(Star):
             return
         if len(games) == 1:
             g = games[0]
-            chain = [Comp.Reply(id=event.message_obj.message_id)]
+
+            # 准备图片（如果有）
+            b64_url = None
             if g.poster_url:
-                chain.append(Comp.Image(file=g.poster_url))
-            chain.append(Comp.Plain(self._fmt_card(g)))
-            yield event.chain_result(chain)
+                b64_url = await self._prepare_image(g.poster_url, g.title)
+
+            group_id = int(event.get_group_id()) if event.get_group_id() else 0
+            if group_id == 0:
+                # 私聊：纯文本
+                yield event.plain_result(self._fmt_card(g))
+            else:
+                bot = self._get_bot()
+                if not bot:
+                    yield event.plain_result("无法获取 bot 实例。")
+                    return
+
+                # 构建消息（群聊）—— 先用 bot.call_action 发带图消息
+                message = [
+                    {"type": "reply", "data": {"id": event.message_obj.message_id}},
+                ]
+                if b64_url:
+                    message.append({"type": "image", "data": {"file": b64_url}})
+                message.append({"type": "text", "data": {"text": self._fmt_card(g)}})
+
+                try:
+                    await bot.call_action("send_group_msg", group_id=group_id, message=message)
+                except Exception as e:
+                    logger.error(f"发送失败，降级重试纯文本: {e}")
+                    # 降级：只发纯文本，不带引用和图片
+                    try:
+                        await bot.call_action("send_group_msg", group_id=group_id,
+                            message=[{"type": "text", "data": {"text": self._fmt_card(g)}}])
+                    except Exception as e2:
+                        yield event.plain_result("发送失败，请查看日志")
         else:
             group_id = int(event.get_group_id()) if event.get_group_id() else 0
             if group_id == 0:
@@ -132,14 +168,16 @@ class GameDownPlugin(Star):
             for g in games:
                 content = []
                 if g.poster_url:
-                    content.append({"type": "image", "data": {"file": g.poster_url}})
+                    b64_url = await self._prepare_image(g.poster_url, g.title)
+                    if b64_url:
+                        content.append({"type": "image", "data": {"file": b64_url}})
                 content.append({"type": "text", "data": {"text": self._fmt_card(g)}})
                 nodes.append({"type": "node", "data": {"user_id": event.get_self_id(), "nickname": "Online-Fix.me", "content": content}})
             try:
                 await bot.call_action("send_group_forward_msg", group_id=group_id, messages=nodes)
             except Exception as e:
                 logger.error(f"合并转发失败: {e}")
-                yield event.plain_result(f"发送失败: {e}")
+                yield event.plain_result("发送失败，请查看日志")
 
     # ---- 订阅 ----
 
@@ -192,8 +230,11 @@ class GameDownPlugin(Star):
         old_ids = seen.get("onlinefix", [])
         if not old_ids:
             seen["onlinefix"] = current_ids
-            data_dir.mkdir(parents=True, exist_ok=True)
-            seen_path.write_text(json.dumps(seen, ensure_ascii=False, indent=2))
+            try:
+                data_dir.mkdir(parents=True, exist_ok=True)
+                seen_path.write_text(json.dumps(seen, ensure_ascii=False, indent=2))
+            except Exception as e:
+                logger.warning(f"写入 seen_games.json 失败: {e}")
             return
 
         new_ids = [i for i in current_ids if i not in old_ids]
@@ -207,17 +248,25 @@ class GameDownPlugin(Star):
 
         if len(new_games) == 1:
             g = new_games[0]
-            msg = [{"type": "image", "data": {"file": g.poster_url}}] if g.poster_url else []
+            msg = []
+            if g.poster_url:
+                b64_url = await self._prepare_image(g.poster_url, g.title)
+                if b64_url:
+                    msg.append({"type": "image", "data": {"file": b64_url}})
             msg.append({"type": "text", "data": {"text": f"新游戏上架！\n\n{self._fmt_card(g)}\n\n发送 /game info {g.title[:20]} 查看详情"}})
             for gid in subs:
                 try:
                     await bot.call_action("send_group_msg", group_id=int(gid), message=msg)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"推送新游戏到群 {gid} 失败: {e}")
         else:
             nodes = []
             for g in new_games:
-                content = [{"type": "image", "data": {"file": g.poster_url}}] if g.poster_url else []
+                content = []
+                if g.poster_url:
+                    b64_url = await self._prepare_image(g.poster_url, g.title)
+                    if b64_url:
+                        content.append({"type": "image", "data": {"file": b64_url}})
                 content.append({"type": "text", "data": {"text": self._fmt_card(g)}})
                 nodes.append({"type": "node", "data": {"user_id": str(bot.self_id) if hasattr(bot, "self_id") else "", "nickname": "新游戏", "content": content}})
             for gid in subs:
@@ -225,12 +274,15 @@ class GameDownPlugin(Star):
                     await bot.call_action("send_group_forward_msg", group_id=int(gid), messages=nodes)
                     await bot.call_action("send_group_msg", group_id=int(gid),
                         message=[{"type": "text", "data": {"text": f"新游戏上架 Online-Fix.me（{len(new_games)} 款）\n发送 /game info <游戏名> 查看详情"}}])
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"推送新游戏到群 {gid} 失败: {e}")
 
         seen["onlinefix"] = current_ids
-        data_dir.mkdir(parents=True, exist_ok=True)
-        seen_path.write_text(json.dumps(seen, ensure_ascii=False, indent=2))
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+            seen_path.write_text(json.dumps(seen, ensure_ascii=False, indent=2))
+        except Exception as e:
+            logger.warning(f"更新 seen_games.json 失败: {e}")
 
     # ---- 工具 ----
 
@@ -260,3 +312,58 @@ class GameDownPlugin(Star):
             if isinstance(p, AiocqhttpAdapter):
                 return p.bot
         return None
+
+    @staticmethod
+    async def _prepare_image(poster_url: str, title: str) -> str | None:
+        """下载远程图片并转为 base64:// URI，同时打印调试信息。
+
+        由插件端完成下载（带 Referer 头），避免 QQ 服务器直连 online-fix.me
+        时因防盗链导致 "rich media transfer failed"。
+        返回 base64://... 或 None（下载失败时降级）。
+        """
+        logger.info(f"[IMG] 游戏={title} | URL={poster_url}")
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                hdrs = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Referer": "https://online-fix.me/",
+                }
+                # HEAD 获取元信息
+                h = await client.head(poster_url, headers=hdrs, follow_redirects=True)
+                ct = h.headers.get("content-type", "?")
+                cl = h.headers.get("content-length", "?")
+                size_str = ""
+                if cl and cl != "?":
+                    try:
+                        size_str = f" ({int(cl)/1024:.1f} KB)"
+                    except ValueError:
+                        pass
+                logger.info(
+                    f"[IMG] HEAD → status={h.status_code} | "
+                    f"Content-Type={ct} | Content-Length={cl}{size_str}"
+                )
+
+                # GET 下载图片
+                r = await client.get(poster_url, headers=hdrs, follow_redirects=True)
+                r.raise_for_status()
+                img_bytes = r.content
+
+                # 解析图片信息
+                try:
+                    img = PILImage.open(io.BytesIO(img_bytes))
+                    logger.info(
+                        f"[IMG] 下载成功 → {len(img_bytes)} bytes "
+                        f"({len(img_bytes)/1024:.1f} KB) | "
+                        f"{img.width}x{img.height} | {img.format} | {img.mode}"
+                    )
+                except Exception:
+                    logger.info(
+                        f"[IMG] 下载成功 → {len(img_bytes)} bytes "
+                        f"({len(img_bytes)/1024:.1f} KB) | 非图片格式"
+                    )
+
+                b64 = base64.b64encode(img_bytes).decode("ascii")
+                return f"base64://{b64}"
+        except Exception as e:
+            logger.warning(f"[IMG] 下载失败，将降级为纯文本: {type(e).__name__}: {e}")
+            return None
