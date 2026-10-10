@@ -13,5 +13,17 @@
     "description": "列表每页最大显示数量",
     "type": "int",
     "default": 21
+  },
+  "send_game_posters": {
+    "description": "是否发送游戏封面",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后不下载、不上传封面；游戏列表、搜索结果和新游戏推送使用纯文字，详情链接保留"
+  },
+  "fallback_to_text_on_upload_failure": {
+    "description": "封面上传失败时自动降级为纯文字",
+    "type": "bool",
+    "default": true,
+    "hint": "仅明确的 QQ 图片上传失败才移除封面并重试一次；OneBot 响应超时、结果不确定时不重发，避免重复消息"
   }
 }
