@@ -12,6 +12,7 @@ class ViewAssetTests(unittest.TestCase):
         self.assertIn("./app.js", html)
         self.assertIn("./style.css", html)
         self.assertIn('type="module"', html)
+        self.assertIn("<title>getGameInfo</title>", html)
         self.assertIn('id="push-check-button"', html)
         self.assertIn('data-tab="maintenance"', html)
         for name in (
@@ -47,8 +48,8 @@ class ViewAssetTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(i18n["views"]["status"]["title"], "运行状态")
-        self.assertEqual(i18n["pages"]["status"]["title"], "运行状态")
+        self.assertEqual(i18n["views"]["status"]["title"], "getGameInfo")
+        self.assertEqual(i18n["pages"]["status"]["title"], "getGameInfo")
         self.assertTrue(i18n["views"]["status"]["description"])
 
     def test_script_files_use_relative_module_imports(self):

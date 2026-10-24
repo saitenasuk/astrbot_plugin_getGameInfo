@@ -966,7 +966,7 @@ async function boot() {
   bindEvents();
   try {
     await ready();
-    document.title = translate("views.status.title", "运行状态");
+    document.title = translate("views.status.title", "getGameInfo");
   } catch (error) {
     setText("subtitle", "无法连接 AstrBot");
     showError(error.message);

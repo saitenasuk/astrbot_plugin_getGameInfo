@@ -1,14 +1,14 @@
 {
   "views": {
     "status": {
-      "title": "运行状态",
-      "description": "查看轮询计划、订阅路由、推送结果与最近事件"
+      "title": "getGameInfo",
+      "description": "查看 getGameInfo 的轮询、订阅与推送状态"
     }
   },
   "pages": {
     "status": {
-      "title": "运行状态",
-      "description": "查看轮询计划、订阅路由、推送结果与最近事件"
+      "title": "getGameInfo",
+      "description": "查看 getGameInfo 的轮询、订阅与推送状态"
     }
   }
 }

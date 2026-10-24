@@ -56,9 +56,9 @@ detail=highway upload transport failed ... TCP connect timeout
 
 无需为了插件升级专门收集这些信息；只有继续排查底层上传连接失败时才需要。调大插件 `request_timeout` 只影响网站 HTTP 请求，不改变 SnowLuma 的 Highway 建连逻辑。
 
-## WebUI 运行状态视图（v0.0.4）
+## WebUI 状态视图（v0.0.4）
 
-1. 在 AstrBot 插件详情页打开「运行状态」视图，确认标题与描述来自 `.astrbot-plugin/i18n/zh-CN.json`。
+1. 在 AstrBot 插件详情页打开「getGameInfo」视图，确认侧边栏/详情页标题为 `getGameInfo`，描述来自 `.astrbot-plugin/i18n/zh-CN.json`。
 2. 概览应显示下次检查时间、上次检查结果、订阅数、追踪游戏数、账号列表和最近事件；明暗主题切换、窄屏（≤480px）可用。
 3. 订阅页应能区分「可推送」「插件未启用」「平台未加载」「旧订阅待迁移」，并显示最近一次投递结果。
 4. 点击「仅检查」：群内不应收到消息，`data/plugin_data/astrbot_plugin_getGameInfo/seen_games.json` 内容不应变化；再次点击应提示操作过于频繁。

@@ -45,7 +45,7 @@ AstrBot 的插件视图（Plugin Views）机制要点（已核对 v4.29.1 源码
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
-│ getGameInfo 运行状态      ● 运行中 · v0.0.3 · AstrBot 4.29.1      │
+│ getGameInfo 控制台        ● 运行中 · v0.0.3 · AstrBot 4.29.1      │
 │ 下次检查 14:00:00（还有 1 小时 23 分）        [刷新] [自动刷新 10s]│
 ├──────────────┬──────────────┬──────────────┬─────────────────────┤
 │ 订阅群 3     │ 追踪游戏 21  │ 今日新游戏 2 │ 今日推送失败 0      │
@@ -369,7 +369,7 @@ pages/status/
 {
   "views": {
     "status": {
-      "title": "运行状态",
+      "title": "getGameInfo",
       "description": "查看轮询、订阅与推送状态"
     }
   }
@@ -437,7 +437,7 @@ pages/status/
 
 ### 手工验收
 
-1. WebUI 插件详情页出现「运行状态」视图，标题/描述正确。
+1. WebUI 插件详情页/侧边栏出现「getGameInfo」视图，标题/描述正确。
 2. 概览显示下次检查倒计时，与日志中「下次新游戏检查将在…」一致。
 3. 订阅表能正确标出 A 可推送、B 被配置文件禁用。
 4. `/check` dry-run 后群内无消息、`seen_games.json` 不变。
@@ -511,7 +511,7 @@ const bridge = window.AstrBotPluginView;
 const context = await bridge.ready();
 
 const status = await bridge.apiGet("status");
-document.title = bridge.t("views.status.title", "运行状态");
+document.title = bridge.t("views.status.title", "getGameInfo");
 
 // POST 示例
 const result = await bridge.apiPost("check", { mode: "dry_run" });
@@ -523,7 +523,7 @@ const result = await bridge.apiPost("check", { mode: "dry_run" });
 {
   "views": {
     "status": {
-      "title": "运行状态",
+      "title": "getGameInfo",
       "description": "查看轮询、订阅与推送状态"
     }
   }
