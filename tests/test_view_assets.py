@@ -13,8 +13,8 @@ class ViewAssetTests(unittest.TestCase):
         self.assertIn("./style.css", html)
         self.assertIn('type="module"', html)
         self.assertIn("<title>getGameInfo</title>", html)
-        self.assertIn('id="push-check-button"', html)
         self.assertIn('data-tab="maintenance"', html)
+        self.assertNotIn("topbar-actions", html)
         for name in (
             "app.js",
             "api.js",

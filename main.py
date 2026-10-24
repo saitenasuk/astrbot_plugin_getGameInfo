@@ -206,7 +206,7 @@ class GameDownPlugin(Star):
             {
                 "group_id": group_id,
                 "platform_id": platform_id,
-                "self_id": str(self_id) if self_id else None,
+                "self_id": self._valid_self_id(self_id),
             }
         )
         await self.put_kv_data("subscriptions", subscriptions)
@@ -808,7 +808,30 @@ class GameDownPlugin(Star):
         return await self._session_plugin_enabled(platform_id, group_id)
 
     @staticmethod
-    def _normalize_subscriptions(raw) -> list[dict]:
+    def _valid_self_id(value) -> str | None:
+        if value is None or isinstance(value, bool):
+            return None
+        text = str(value).strip()
+        if text.isdigit() and 1 <= len(text) <= 20:
+            return text
+        return None
+
+    @classmethod
+    def _safe_self_id(cls, bot) -> str | None:
+        """Return a numeric QQ id; never the CQHttp API partial repr."""
+        value = getattr(bot, "self_id", None)
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            valid = cls._valid_self_id(value)
+            if valid:
+                return valid
+        for attr in ("_self_id", "user_id"):
+            valid = cls._valid_self_id(getattr(bot, attr, None))
+            if valid:
+                return valid
+        return None
+
+    @classmethod
+    def _normalize_subscriptions(cls, raw) -> list[dict]:
         """Accept both the legacy ``["group_id"]`` list and the new records."""
         subscriptions: list[dict] = []
         if not isinstance(raw, list):
@@ -826,7 +849,7 @@ class GameDownPlugin(Star):
             subscriptions.append({
                 "group_id": str(group_id),
                 "platform_id": str(platform_id) if platform_id else None,
-                "self_id": str(self_id) if self_id else None,
+                "self_id": cls._valid_self_id(self_id),
             })
         return subscriptions
 
@@ -931,9 +954,9 @@ class GameDownPlugin(Star):
         return bot
 
     async def _bot_self_id(self, bot) -> str | None:
-        self_id = getattr(bot, "self_id", None)
+        self_id = self._safe_self_id(bot)
         if self_id:
-            return str(self_id)
+            return self_id
         try:
             login_info = await call_action(bot, "get_login_info")
         except OneBotActionError as e:
@@ -942,7 +965,7 @@ class GameDownPlugin(Star):
         if isinstance(login_info, dict) and isinstance(login_info.get("data"), dict):
             login_info = login_info["data"]
         user_id = login_info.get("user_id") if isinstance(login_info, dict) else None
-        return str(user_id) if user_id else None
+        return self._valid_self_id(user_id)
 
     async def _card_segments(self, g: GameBrief) -> list[dict]:
         content = []

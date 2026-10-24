@@ -48,14 +48,12 @@ function renderSchedule(status) {
         </div>
       </div>
       <div class="schedule-big">
+        <span class="schedule-prefix">下次检查</span>
         <span id="next-check-time" class="schedule-time">${
           schedule.next_check_at
             ? escapeHtml(formatTime(schedule.next_check_at))
             : "—"
         }</span>
-        <span id="next-check-countdown" class="schedule-countdown">
-          ${schedule.seconds_until_next != null ? "计算中…" : "暂无计划"}
-        </span>
       </div>
       <dl class="detail-list" style="margin-top: 10px">
         <dt>检查间隔</dt>
@@ -94,7 +92,7 @@ function renderLastCheck(status) {
     return `
       <section class="card">
         <div class="card-head"><h2 class="card-title">上次检查</h2></div>
-        <p class="muted">插件启动后还没有执行过检查。下一次整点会自动执行，也可以点击右上角「仅检查」立即预检。</p>
+        <p class="muted">插件启动后还没有执行过检查。下一次整点会自动执行，也可以在下方「快捷操作」中点击「仅检查」立即预检。</p>
       </section>`;
   }
   const resultTone = last.ok ? "success" : "danger";
@@ -185,10 +183,9 @@ function renderAccounts(status) {
         ${accounts
           .map(
             (account) => `
-          <dt class="mono">${escapeHtml(account.platform_id || "未知平台")}</dt>
+          <dt class="mono">${escapeHtml(account.platform_id || "未知账号")}</dt>
           <dd>
-            ${account.self_id ? `<span class="mono">${escapeHtml(account.self_id)}</span>` : "未连接"}
-            <span class="faint"> · ${escapeHtml(account.subscriptions || 0)} 个订阅</span>
+            <span class="faint">${escapeHtml(account.subscriptions || 0)} 个订阅</span>
             ${badge(
               ACCOUNT_STATUS_LABELS[account.status] || account.status || "未知",
               account.status === "running"

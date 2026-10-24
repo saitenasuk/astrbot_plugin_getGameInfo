@@ -113,12 +113,6 @@ h1 {
   font-size: 13px;
 }
 
-.topbar-actions {
-  display: flex;
-  gap: 8px;
-  flex-shrink: 0;
-}
-
 .topbar-meta {
   display: flex;
   flex-wrap: wrap;
@@ -461,9 +455,9 @@ h1 {
   font-variant-numeric: tabular-nums;
 }
 
-.schedule-countdown {
-  color: var(--brand);
-  font-weight: 600;
+.schedule-prefix {
+  color: var(--text-muted);
+  font-size: 13px;
 }
 
 .detail-list {
@@ -1015,14 +1009,6 @@ tr:last-child td {
 @media (max-width: 720px) {
   .topbar-main {
     flex-direction: column;
-  }
-
-  .topbar-actions {
-    width: 100%;
-  }
-
-  .topbar-actions .button {
-    flex: 1;
   }
 
   .kpi-row {

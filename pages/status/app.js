@@ -572,7 +572,7 @@ function openAddSubscription() {
          .map(
            (account) =>
              `<option value="${escapeHtml(account.platform_id)}">${escapeHtml(
-               `${account.platform_id}${account.self_id ? ` · ${account.self_id}` : ""}`,
+               account.platform_id,
              )}</option>`,
          )
          .join("")}
@@ -775,24 +775,6 @@ function renderChrome() {
       .join("");
   }
 
-  const busy = state.checking || runtime?.checking;
-  const ready = Boolean(runtime?.scraper_ready);
-  const checkButton = document.getElementById("check-button");
-  if (checkButton) {
-    checkButton.disabled = Boolean(busy || !ready);
-    checkButton.textContent =
-      state.checking && state.checkMode === "dry_run" ? "检查中…" : "仅检查";
-  }
-  const pushButton = document.getElementById("push-check-button");
-  if (pushButton) {
-    pushButton.disabled = Boolean(busy || !ready);
-    pushButton.textContent =
-      state.checking && state.checkMode === "push"
-        ? "推送中…"
-        : "检查并推送";
-  }
-  const refreshButton = document.getElementById("refresh-button");
-  if (refreshButton) refreshButton.disabled = false;
 }
 
 function render() {
@@ -844,22 +826,18 @@ function render() {
 
 function updateCountdown() {
   const schedule = state.status?.schedule;
-  const countdown = document.getElementById("next-check-countdown");
   const topLine = document.getElementById("countdown-line");
+  if (!topLine) return;
   if (schedule?.seconds_until_next == null) {
-    if (countdown) countdown.textContent = "暂无计划";
-    if (topLine) topLine.textContent = "";
+    topLine.textContent = "";
     return;
   }
   const elapsed = (Date.now() - state.countdownFetchedAt) / 1000;
   const remaining = Math.max(0, schedule.seconds_until_next - elapsed);
   const text = remaining > 0 ? `还有 ${formatRemaining(remaining)}` : "即将检查";
-  if (countdown) countdown.textContent = text;
-  if (topLine) {
-    topLine.textContent = schedule.next_check_at
-      ? `下次检查 ${formatDateTime(schedule.next_check_at)} · ${text}`
-      : text;
-  }
+  topLine.textContent = schedule.next_check_at
+    ? `下次检查 ${formatDateTime(schedule.next_check_at)} · ${text}`
+    : text;
 }
 
 function setTab(tab) {
@@ -945,17 +923,8 @@ function bindEvents() {
     tab.addEventListener("click", () => setTab(tab.dataset.tab));
   });
   document
-    .getElementById("refresh-button")
-    ?.addEventListener("click", () => refreshCurrent());
-  document
     .getElementById("retry-button")
     ?.addEventListener("click", () => refreshCurrent());
-  document
-    .getElementById("check-button")
-    ?.addEventListener("click", () => runDryCheck());
-  document
-    .getElementById("push-check-button")
-    ?.addEventListener("click", () => runCheck("push"));
   window.addEventListener("hashchange", () => {
     const tab = location.hash.replace(/^#/, "");
     if (tab && tab !== state.tab) setTab(tab);

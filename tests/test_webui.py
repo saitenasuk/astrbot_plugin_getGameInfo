@@ -1,3 +1,4 @@
+import functools
 import json
 import tempfile
 import unittest
@@ -446,6 +447,9 @@ class ViewApiTests(unittest.IsolatedAsyncioTestCase):
                 return {"data": [{"group_id": 123, "group_name": "Group A"}]}
 
         self.bot_a.handler = handler
+        # aiocqhttp exposes bot.self_id as an API partial; it must not leak into
+        # the account card or the stored subscription.
+        self.bot_a.self_id = functools.partial(lambda: None)
         groups = await self.call("/groups", query={"platform_id": "bot-a"})
         self.assertEqual(groups.status_code, 200)
         self.assertEqual(groups.data["items"], [{"group_id": "123", "group_name": "Group A"}])
@@ -456,11 +460,23 @@ class ViewApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(added.status_code, 200)
         self.assertTrue(added.data["changed"])
         self.assertEqual(self.plugin.kv["subscriptions"][0]["platform_id"], "bot-a")
+        self.assertEqual(self.plugin.kv["subscriptions"][0]["self_id"], "789")
         missing = await self.call(
             "/subscriptions/add",
             body={"group_id": "456", "platform_id": "bot-a"},
         )
         self.assertEqual(missing.status_code, 400)
+
+    async def test_status_hides_cqhttp_callable_self_id(self):
+        self.bot_a.self_id = functools.partial(lambda: None)
+        response = await self.call("/status")
+        account = next(
+            item
+            for item in response.data["accounts"]
+            if item["platform_id"] == "bot-a"
+        )
+        self.assertIsNone(account["self_id"])
+        self.assertNotIn("functools.partial", json.dumps(response.data))
 
     async def test_test_push_failure_records_detail_for_retry(self):
         self.plugin.kv["subscriptions"] = [

@@ -257,7 +257,7 @@ async def _build_status(plugin) -> dict[str, Any]:
         accounts.append(
             {
                 "platform_id": platform_id,
-                "self_id": str(getattr(bot, "self_id", "") or "") or None,
+                "self_id": plugin._safe_self_id(bot),
                 "status": getattr(state, "value", None) or "unknown",
                 "subscriptions": sum(
                     1
@@ -376,9 +376,7 @@ async def _build_subscription_items(plugin) -> tuple[list[dict], dict]:
                     and resolved != subscription.get("platform_id")
                 ),
                 "account_self_id": (
-                    str(getattr(bot, "self_id", "") or "") or None
-                    if bot is not None
-                    else None
+                    plugin._safe_self_id(bot) if bot is not None else None
                 ),
                 "last_delivery": plugin.status.get_delivery(
                     subscription.get("platform_id") or resolved,
@@ -726,7 +724,7 @@ def register_view_apis(plugin, context) -> None:
                 "ok": True,
                 "group_id": group_id,
                 "platform_id": platform_used,
-                "self_id": str(getattr(bot, "self_id", "") or "") or None,
+                "self_id": plugin._safe_self_id(bot),
             }
         )
 
@@ -888,7 +886,7 @@ def register_view_apis(plugin, context) -> None:
                 status_code=409,
             )
         changed = await plugin.add_subscription(
-            group_id, platform_id, getattr(bot, "self_id", None)
+            group_id, platform_id, await plugin._bot_self_id(bot)
         )
         return json_response(
             {
