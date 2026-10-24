@@ -25,6 +25,19 @@ from tests.support import (
 )
 
 
+def plugin_context(insts, profiles=None):
+    """Context double with AstrBot's per-UMO config profile lookup."""
+    profiles = profiles or {}
+
+    def get_config(umo=None):
+        return {"plugin_set": profiles.get(umo or "", ["*"])}
+
+    return SimpleNamespace(
+        platform_manager=SimpleNamespace(platform_insts=insts),
+        get_config=get_config,
+    )
+
+
 class PluginTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.config = {"request_timeout": 30, "max_display_items": 21}
@@ -275,10 +288,129 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_subscription_commands_preserve_existing_storage(self):
         self.assertIn("已订阅", (await self.consume("/game subscribe"))[-1])
-        self.assertEqual(self.plugin.kv["subscriptions"], ["123"])
+        self.assertEqual(
+            self.plugin.kv["subscriptions"],
+            [{
+                "group_id": "123",
+                "platform_id": "test-platform",
+                "self_id": "789",
+            }],
+        )
         self.assertIn("本群已订阅", (await self.consume("/game subscribe"))[-1])
         self.assertIn("已取消", (await self.consume("/game unsubscribe"))[-1])
         self.assertEqual(self.plugin.kv["subscriptions"], [])
+
+    async def test_resubscribe_moves_group_to_the_receiving_account(self):
+        await self.consume("/game subscribe")
+        self.event.platform_id = "other-platform"
+        self.event.self_id = "999"
+        self.assertNotIn("本群已订阅", (await self.consume("/game subscribe"))[-1])
+        self.assertEqual(
+            self.plugin.kv["subscriptions"],
+            [{
+                "group_id": "123",
+                "platform_id": "other-platform",
+                "self_id": "999",
+            }],
+        )
+
+    async def test_unsubscribe_removes_group_bound_to_another_account(self):
+        self.plugin.kv["subscriptions"] = [{
+            "group_id": "123",
+            "platform_id": "other-platform",
+            "self_id": "999",
+        }]
+        self.assertIn("已取消", (await self.consume("/game unsubscribe"))[-1])
+        self.assertEqual(self.plugin.kv["subscriptions"], [])
+
+    async def test_push_uses_account_that_received_legacy_subscription(self):
+        self.plugin.name = "astrbot_plugin_getGameInfo"
+        bot_a = FakeBot(self_id="111")
+        bot_b = FakeBot(self_id="222")
+        # The account without plugin permission is listed first, as in the
+        # reported setup; the push must still use the subscribed account.
+        self.plugin.context = plugin_context(
+            [FakeAdapter(bot_b, "bot-b"), FakeAdapter(bot_a, "bot-a")],
+            {
+                "bot-a:GroupMessage:123": ["astrbot_plugin_getGameInfo"],
+                "bot-b:GroupMessage:123": ["another_plugin"],
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "plugin_data" / "astrbot_plugin_getGameInfo"
+            folder.mkdir(parents=True)
+            (folder / "seen_games.json").write_text(json.dumps({"onlinefix": ["old"]}))
+            with patch.object(main, "get_astrbot_data_path", return_value=directory):
+                await self.plugin._push_new_games(["123"], games(1))
+        self.assertEqual(bot_b.calls, [])
+        self.assertTrue(any(a == "send_group_msg" for a, _ in bot_a.calls))
+        self.assertEqual(self.plugin.kv["subscriptions"][0]["platform_id"], "bot-a")
+
+    async def test_push_routes_each_group_to_its_subscribed_account(self):
+        bot_a = FakeBot(self_id="111")
+        bot_b = FakeBot(self_id="222")
+        self.plugin.context = plugin_context(
+            [FakeAdapter(bot_a, "bot-a"), FakeAdapter(bot_b, "bot-b")],
+        )
+        subs = [
+            {"group_id": "123", "platform_id": "bot-a", "self_id": "111"},
+            {"group_id": "456", "platform_id": "bot-b", "self_id": "222"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "plugin_data" / "astrbot_plugin_getGameInfo"
+            folder.mkdir(parents=True)
+            (folder / "seen_games.json").write_text(json.dumps({"onlinefix": ["old"]}))
+            with patch.object(main, "get_astrbot_data_path", return_value=directory):
+                await self.plugin._push_new_games(subs, games(2))
+        forwards_a = [p for a, p in bot_a.calls if a == "send_group_forward_msg"]
+        forwards_b = [p for a, p in bot_b.calls if a == "send_group_forward_msg"]
+        self.assertEqual([p["group_id"] for p in forwards_a], [123])
+        self.assertEqual([p["group_id"] for p in forwards_b], [456])
+        self.assertEqual(forwards_a[0]["messages"][0]["data"]["user_id"], "111")
+        self.assertEqual(forwards_b[0]["messages"][0]["data"]["user_id"], "222")
+        self.assertEqual(
+            [p["group_id"] for a, p in bot_a.calls if a == "send_group_msg"], [123]
+        )
+        self.assertEqual(
+            [p["group_id"] for a, p in bot_b.calls if a == "send_group_msg"], [456]
+        )
+
+    async def test_push_skips_group_when_account_profile_disables_plugin(self):
+        bot_b = FakeBot()
+        self.plugin.name = "astrbot_plugin_getGameInfo"
+        self.plugin.context = plugin_context(
+            [FakeAdapter(bot_b, "bot-b")],
+            {"bot-b:GroupMessage:123": ["another_plugin"]},
+        )
+        with tempfile.TemporaryDirectory() as directory, self.assertLogs(
+            "getgameinfo-tests", level="WARNING"
+        ) as logs:
+            folder = Path(directory) / "plugin_data" / "astrbot_plugin_getGameInfo"
+            folder.mkdir(parents=True)
+            (folder / "seen_games.json").write_text(json.dumps({"onlinefix": ["old"]}))
+            with patch.object(main, "get_astrbot_data_path", return_value=directory):
+                await self.plugin._push_new_games(
+                    [{"group_id": "123", "platform_id": "bot-b"}], games(1)
+                )
+        self.assertEqual(bot_b.calls, [])
+        self.assertIn("未启用本插件", "\n".join(logs.output))
+
+    async def test_push_skips_group_disabled_by_session_rule(self):
+        bot = FakeBot()
+        self.plugin.context = plugin_context([FakeAdapter(bot, "bot-a")])
+        self.plugin._session_plugin_enabled = AsyncMock(return_value=False)
+        with tempfile.TemporaryDirectory() as directory, self.assertLogs(
+            "getgameinfo-tests", level="WARNING"
+        ) as logs:
+            folder = Path(directory) / "plugin_data" / "astrbot_plugin_getGameInfo"
+            folder.mkdir(parents=True)
+            (folder / "seen_games.json").write_text(json.dumps({"onlinefix": ["old"]}))
+            with patch.object(main, "get_astrbot_data_path", return_value=directory):
+                await self.plugin._push_new_games(
+                    [{"group_id": "123", "platform_id": "bot-a"}], games(1)
+                )
+        self.assertEqual(bot.calls, [])
+        self.assertIn("未启用本插件", "\n".join(logs.output))
 
     async def test_push_single_poster_failure_falls_back(self):
         with tempfile.TemporaryDirectory() as directory:

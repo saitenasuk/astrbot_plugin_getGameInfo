@@ -60,25 +60,49 @@ class FakeBot:
 
 
 class FakeEvent:
-    def __init__(self, text="/game list", *, group_id="123", bot=None):
+    def __init__(
+        self,
+        text="/game list",
+        *,
+        group_id="123",
+        bot=None,
+        platform_id="test-platform",
+        self_id="789",
+    ):
         self.message_str = text
         self.group_id = group_id
         self.bot = bot or FakeBot()
+        self.platform_id = platform_id
+        self.self_id = self_id
+        self.unified_msg_origin = (
+            f"{platform_id}:GroupMessage:{group_id}" if platform_id else ""
+        )
         self.message_obj = SimpleNamespace(message_id="request-message")
 
     def get_group_id(self):
         return self.group_id
 
     def get_self_id(self):
-        return "789"
+        return self.self_id
+
+    def get_platform_id(self):
+        return self.platform_id
 
     def plain_result(self, text):
         return text
 
 
 class FakeAdapter:
-    def __init__(self, bot):
+    def __init__(self, bot, platform_id=None, config=None):
         self.bot = bot
+        self.config = config or {}
+        self.platform_id = platform_id
+
+    def meta(self):
+        return SimpleNamespace(name="aiocqhttp", id=self.platform_id)
+
+    def get_client(self):
+        return self.bot
 
 
 class FakeStar:

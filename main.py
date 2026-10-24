@@ -20,6 +20,12 @@ from .scraper import BaseGameScraper, OnlineFixScraper
 
 SCRAPER_REGISTRY: dict[str, type[BaseGameScraper]] = {"onlinefix": OnlineFixScraper}
 
+# Used when the loader has not injected ``name`` yet (for example in tests).
+PLUGIN_NAME_FALLBACK = "astrbot_plugin_getGameInfo"
+# ``MessageType.GROUP_MESSAGE.value``; kept local so the plugin does not need
+# another AstrBot import just to build a UMO for profile lookups.
+GROUP_MESSAGE_TYPE = "GroupMessage"
+
 
 class GameDownPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -167,22 +173,41 @@ class GameDownPlugin(Star):
         gid = event.get_group_id()
         if not gid:
             yield event.plain_result("仅支持在群聊中订阅。"); return
-        subs: list = await self.get_kv_data("subscriptions", [])
-        if gid in subs:
+        subscriptions = self._normalize_subscriptions(
+            await self.get_kv_data("subscriptions", [])
+        )
+        platform_id = self._event_platform_id(event)
+        record = {
+            "group_id": str(gid),
+            "platform_id": platform_id,
+            "self_id": str(event.get_self_id()) if event.get_self_id() else None,
+        }
+        existing = next(
+            (item for item in subscriptions if item["group_id"] == record["group_id"]),
+            None,
+        )
+        if existing is not None and existing.get("platform_id") == platform_id:
             yield event.plain_result("本群已订阅。"); return
-        subs.append(gid)
-        await self.put_kv_data("subscriptions", subs)
+        # A group is pushed by one account only: subscribing again (possibly
+        # with another bot in the same group) moves the subscription here.
+        subscriptions = [
+            item for item in subscriptions if item["group_id"] != record["group_id"]
+        ]
+        subscriptions.append(record)
+        await self.put_kv_data("subscriptions", subscriptions)
         yield event.plain_result("已订阅新游戏推送。\n发送 /game unsubscribe 取消。")
 
     async def _cmd_unsubscribe(self, event: AstrMessageEvent):
         gid = event.get_group_id()
         if not gid:
             yield event.plain_result("仅支持在群聊中操作。"); return
-        subs: list = await self.get_kv_data("subscriptions", [])
-        if gid not in subs:
+        subscriptions = self._normalize_subscriptions(
+            await self.get_kv_data("subscriptions", [])
+        )
+        remaining = [item for item in subscriptions if item["group_id"] != str(gid)]
+        if len(remaining) == len(subscriptions):
             yield event.plain_result("本群未订阅。"); return
-        subs.remove(gid)
-        await self.put_kv_data("subscriptions", subs)
+        await self.put_kv_data("subscriptions", remaining)
         yield event.plain_result("已取消新游戏推送。")
 
     # ---- 新游戏轮询 ----
@@ -237,8 +262,23 @@ class GameDownPlugin(Star):
             return
 
         new_games = [g for g in games if g.id in new_ids]
-        bot = self._get_bot()
-        if not bot:
+
+        # One AstrBot can run several OneBot accounts that are all members of
+        # the same group. Resolve each subscription to the account that owns
+        # it; sending through the first account may use one that has this
+        # plugin disabled in its bound config profile.
+        subscriptions = self._normalize_subscriptions(subs)
+        targets: dict[int, tuple[object, list[str]]] = {}
+        for subscription in subscriptions:
+            bot = await self._resolve_subscription_bot(subscription)
+            if bot is None:
+                continue
+            gids = targets.setdefault(id(bot), (bot, []))[1]
+            if subscription["group_id"] not in gids:
+                gids.append(subscription["group_id"])
+
+        if not targets:
+            logger.warning("没有可用的订阅机器人账号，本次新游戏推送已跳过")
             return
 
         if len(new_games) == 1:
@@ -247,43 +287,51 @@ class GameDownPlugin(Star):
             msg[-1]["data"]["text"] = (
                 f"新游戏上架！\n\n{self._fmt_card(g)}\n\n发送 /game info {g.title[:20]} 查看详情"
             )
-            for gid in subs:
-                try:
-                    await self._send_group_with_fallback(
-                        bot, "send_group_msg", int(gid), message=msg,
-                    )
-                except OneBotActionError as e:
-                    logger.warning("推送新游戏到群 %s 失败: %s", gid, e.diagnostic())
-                except Exception as e:
-                    logger.warning("推送新游戏到群 %s 异常: %s", gid, type(e).__name__)
+            for bot, gids in targets.values():
+                for gid in gids:
+                    try:
+                        await self._send_group_with_fallback(
+                            bot, "send_group_msg", int(gid), message=msg,
+                        )
+                    except OneBotActionError as e:
+                        logger.warning("推送新游戏到群 %s 失败: %s", gid, e.diagnostic())
+                    except Exception as e:
+                        logger.warning("推送新游戏到群 %s 异常: %s", gid, type(e).__name__)
         else:
-            self_id = getattr(bot, "self_id", None)
-            if not self_id:
-                try:
-                    login_info = await call_action(bot, "get_login_info")
-                    if isinstance(login_info, dict) and isinstance(login_info.get("data"), dict):
-                        login_info = login_info["data"]
-                    self_id = login_info.get("user_id") if isinstance(login_info, dict) else None
-                except OneBotActionError as e:
-                    logger.warning("获取订阅推送机器人账号失败: %s", e.diagnostic())
-                    return
-            if not self_id:
-                logger.warning("无法确定订阅推送机器人账号，暂不生成转发节点")
-                return
-            nodes = await self._build_nodes(new_games, str(self_id), "新游戏")
-            for gid in subs:
-                try:
-                    await self._send_group_with_fallback(
-                        bot, "send_group_forward_msg", int(gid), messages=nodes,
+            # Posters are downloaded once and shared by every account.
+            cards = [await self._card_segments(g) for g in new_games]
+            for bot, gids in targets.values():
+                self_id = await self._bot_self_id(bot)
+                if not self_id:
+                    logger.warning(
+                        "无法确定推送账号，跳过 %s 个群的转发推送", len(gids),
                     )
-                    await call_action(bot, "send_group_msg", group_id=int(gid), message=[{
-                        "type": "text", "data": {"text":
-                            f"新游戏上架 Online-Fix.me（{len(new_games)} 款）\n发送 /game info <游戏名> 查看详情"},
-                    }])
-                except OneBotActionError as e:
-                    logger.warning("推送新游戏到群 %s 失败: %s", gid, e.diagnostic())
-                except Exception as e:
-                    logger.warning("推送新游戏到群 %s 异常: %s", gid, type(e).__name__)
+                    continue
+                nodes = [
+                    {"type": "node", "data": {
+                        "user_id": self_id, "nickname": "新游戏", "content": content,
+                    }}
+                    for content in cards
+                ]
+                for gid in gids:
+                    try:
+                        await self._send_group_with_fallback(
+                            bot, "send_group_forward_msg", int(gid), messages=nodes,
+                        )
+                        await call_action(bot, "send_group_msg", group_id=int(gid), message=[{
+                            "type": "text", "data": {"text":
+                                f"新游戏上架 Online-Fix.me（{len(new_games)} 款）\n发送 /game info <游戏名> 查看详情"},
+                        }])
+                    except OneBotActionError as e:
+                        logger.warning("推送新游戏到群 %s 失败: %s", gid, e.diagnostic())
+                    except Exception as e:
+                        logger.warning("推送新游戏到群 %s 异常: %s", gid, type(e).__name__)
+
+        # Persist migrations from legacy group-id-only entries.
+        try:
+            await self.put_kv_data("subscriptions", subscriptions)
+        except Exception:
+            logger.warning("保存订阅机器人信息失败", exc_info=True)
 
         seen["onlinefix"] = current_ids
         try:
@@ -328,11 +376,191 @@ class GameDownPlugin(Star):
         # the first OneBot account in the platform manager.
         if event is not None and getattr(event, "bot", None) is not None:
             return event.bot
-        from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_platform_adapter import AiocqhttpAdapter
-        for p in self.context.platform_manager.platform_insts:
-            if isinstance(p, AiocqhttpAdapter):
-                return p.bot
+        for inst in self._aiocqhttp_insts():
+            bot = self._inst_bot(inst)
+            if bot is not None:
+                return bot
         return None
+
+    # ---- 多账号订阅 ----
+
+    def _plugin_name(self) -> str:
+        name = getattr(self, "name", None)
+        return name if isinstance(name, str) and name else PLUGIN_NAME_FALLBACK
+
+    @staticmethod
+    def _event_platform_id(event) -> str | None:
+        getter = getattr(event, "get_platform_id", None)
+        if not callable(getter):
+            return None
+        try:
+            platform_id = getter()
+        except Exception:
+            return None
+        return str(platform_id) if platform_id else None
+
+    @staticmethod
+    def _inst_platform_id(inst) -> str | None:
+        meta = getattr(inst, "meta", None)
+        if callable(meta):
+            try:
+                meta = meta()
+            except Exception:
+                meta = None
+        platform_id = getattr(meta, "id", None)
+        if not platform_id:
+            config = getattr(inst, "config", None)
+            if isinstance(config, dict):
+                platform_id = config.get("id")
+        return str(platform_id) if platform_id else None
+
+    @staticmethod
+    def _inst_bot(inst):
+        bot = getattr(inst, "bot", None)
+        if bot is not None:
+            return bot
+        get_client = getattr(inst, "get_client", None)
+        if callable(get_client):
+            try:
+                return get_client()
+            except Exception:
+                return None
+        return None
+
+    def _aiocqhttp_insts(self) -> list:
+        insts = []
+        for inst in self.context.platform_manager.platform_insts:
+            meta = getattr(inst, "meta", None)
+            if callable(meta):
+                try:
+                    meta = meta()
+                except Exception:
+                    meta = None
+            if getattr(meta, "name", None) == "aiocqhttp":
+                insts.append(inst)
+        return insts
+
+    def _find_platform(self, platform_id: str):
+        for inst in self._aiocqhttp_insts():
+            if self._inst_platform_id(inst) == platform_id:
+                return inst
+        return None
+
+    async def _session_plugin_enabled(self, platform_id: str, group_id: str) -> bool:
+        """Respect the per-session plugin disable list from the WebUI."""
+        try:
+            from astrbot.core.star.session_plugin_manager import SessionPluginManager
+            return await SessionPluginManager.is_plugin_enabled_for_session(
+                f"{platform_id}:{GROUP_MESSAGE_TYPE}:{group_id}",
+                self._plugin_name(),
+            )
+        except Exception:
+            # The helper is optional; never block pushes when it is missing.
+            return True
+
+    async def _plugin_allowed(self, platform_id: str, group_id: str) -> bool:
+        """Check the config profile bound to ``platform_id`` for this plugin.
+
+        AstrBot profiles select plugins via ``plugin_set``; a background task
+        is not filtered by that list, so the pusher has to check it itself.
+        """
+        get_config = getattr(self.context, "get_config", None)
+        if not callable(get_config):
+            return await self._session_plugin_enabled(platform_id, group_id)
+        try:
+            config = get_config(umo=f"{platform_id}:{GROUP_MESSAGE_TYPE}:{group_id}")
+            allowed = config.get("plugin_set", ["*"])
+        except Exception:
+            return await self._session_plugin_enabled(platform_id, group_id)
+        if isinstance(allowed, (list, tuple)):
+            if list(allowed) != ["*"] and self._plugin_name() not in allowed:
+                return False
+        return await self._session_plugin_enabled(platform_id, group_id)
+
+    @staticmethod
+    def _normalize_subscriptions(raw) -> list[dict]:
+        """Accept both the legacy ``["group_id"]`` list and the new records."""
+        subscriptions: list[dict] = []
+        if not isinstance(raw, list):
+            return subscriptions
+        for item in raw:
+            if isinstance(item, str):
+                item = {"group_id": item}
+            if not isinstance(item, dict):
+                continue
+            group_id = item.get("group_id")
+            if not group_id:
+                continue
+            platform_id = item.get("platform_id")
+            self_id = item.get("self_id")
+            subscriptions.append({
+                "group_id": str(group_id),
+                "platform_id": str(platform_id) if platform_id else None,
+                "self_id": str(self_id) if self_id else None,
+            })
+        return subscriptions
+
+    async def _resolve_subscription_bot(self, subscription: dict):
+        """Return the account that should deliver this group's push."""
+        group_id = subscription["group_id"]
+        platform_id = subscription.get("platform_id")
+
+        if platform_id:
+            inst = self._find_platform(platform_id)
+            if inst is not None:
+                if not await self._plugin_allowed(platform_id, group_id):
+                    logger.warning(
+                        "平台 %s 的配置文件未启用本插件，跳过群 %s 的推送",
+                        platform_id, group_id,
+                    )
+                    return None
+                bot = self._inst_bot(inst)
+                if bot is None:
+                    logger.warning(
+                        "平台 %s 的机器人实例不可用，跳过群 %s 的推送",
+                        platform_id, group_id,
+                    )
+                return bot
+            logger.warning(
+                "订阅所属平台 %s 未加载，将在其他账号中重新选择", platform_id,
+            )
+
+        # Legacy entries (or a renamed platform) only have the group id, so
+        # pick the first account whose profile still enables this plugin.
+        candidates: list[tuple[str, object]] = []
+        for inst in self._aiocqhttp_insts():
+            candidate_id = self._inst_platform_id(inst)
+            if not candidate_id or not await self._plugin_allowed(
+                candidate_id, group_id
+            ):
+                continue
+            bot = self._inst_bot(inst)
+            if bot is not None:
+                candidates.append((candidate_id, bot))
+        if candidates:
+            subscription["platform_id"] = candidates[0][0]
+            return candidates[0][1]
+
+        if any(self._inst_platform_id(inst) for inst in self._aiocqhttp_insts()):
+            logger.warning("群 %s 没有启用本插件的机器人账号，跳过推送", group_id)
+            return None
+        # Custom/older adapters may not expose a platform id; keep the old
+        # first-account behavior for them instead of dropping the push.
+        return self._get_bot()
+
+    async def _bot_self_id(self, bot) -> str | None:
+        self_id = getattr(bot, "self_id", None)
+        if self_id:
+            return str(self_id)
+        try:
+            login_info = await call_action(bot, "get_login_info")
+        except OneBotActionError as e:
+            logger.warning("获取订阅推送机器人账号失败: %s", e.diagnostic())
+            return None
+        if isinstance(login_info, dict) and isinstance(login_info.get("data"), dict):
+            login_info = login_info["data"]
+        user_id = login_info.get("user_id") if isinstance(login_info, dict) else None
+        return str(user_id) if user_id else None
 
     async def _card_segments(self, g: GameBrief) -> list[dict]:
         content = []
