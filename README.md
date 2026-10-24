@@ -42,3 +42,4 @@ python -m unittest discover -s tests -v
 ```
 
 测试使用模拟 AstrBot / OneBot 及合成网页，不会发送 QQ 消息或访问游戏网站。真实环境复测见 [docs/TESTING.md](docs/TESTING.md)。
+完整版本记录见 [CHANGELOG.md](CHANGELOG.md)。
