@@ -1,0 +1,557 @@
+"""WebUI view APIs for astrbot_plugin_getGameInfo.
+
+The view lives in ``pages/status/`` and talks to these handlers through
+``window.AstrBotPluginView``. AstrBot's Dashboard supplies authentication;
+handlers only validate and shape data.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from datetime import datetime
+from typing import Any
+from urllib.parse import urlparse, urlunparse
+
+try:  # AstrBot >= 4.26
+    from astrbot.api.web import error_response, json_response, request
+except (ImportError, AttributeError):  # pragma: no cover - AstrBot 4.25 fallback
+    from quart import jsonify, request  # type: ignore[no-redef]
+
+    def json_response(  # type: ignore[misc]
+        data: Any = None,
+        *,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> Any:
+        response = jsonify({} if data is None else data)
+        response.status_code = status_code
+        if headers:
+            response.headers.update(headers)
+        return response
+
+    def error_response(  # type: ignore[misc]
+        message: str,
+        *,
+        status_code: int = 400,
+        data: Any = None,
+        headers: dict[str, str] | None = None,
+    ) -> Any:
+        return json_response(
+            {"status": "error", "message": message, "data": data},
+            status_code=status_code,
+            headers=headers,
+        )
+
+from .status import CheckBusyError
+
+try:
+    from astrbot.api import logger
+except ImportError:  # pragma: no cover - tests import through the plugin loader
+    logger = logging.getLogger(__name__)
+
+PLUGIN_NAME = "astrbot_plugin_getGameInfo"
+SITE_URL = "https://online-fix.me"
+GAME_CACHE_TTL = 60.0
+MANUAL_CHECK_COOLDOWN = 10.0
+MAX_LIST_LIMIT = 50
+MAX_EVENT_LIMIT = 200
+
+STATE_LABELS = {
+    "ready": "可推送",
+    "legacy": "旧订阅，将自动迁移",
+    "plugin_disabled": "插件未启用（配置文件或会话规则）",
+    "platform_missing": "平台未加载",
+    "bot_unavailable": "机器人实例不可用",
+    "no_eligible_account": "没有可用账号",
+}
+
+
+# ---- request helpers (AstrBot 4.26 proxy and Quart fallback) ----
+
+
+def _query_params() -> Any:
+    query = getattr(request, "query", None)
+    if query is not None:
+        return query
+    return getattr(request, "args", None)
+
+
+def _query_get(key: str, default: Any = None, cast: Any = None) -> Any:
+    query = _query_params()
+    if query is None:
+        return default
+    try:
+        if cast is not None:
+            return query.get(key, default, type=cast)
+        return query.get(key, default)
+    except TypeError:
+        value = query.get(key, default)
+        if cast is not None and value is not None:
+            try:
+                return cast(value)
+            except (TypeError, ValueError):
+                return default
+        return value
+
+
+async def _json_body(default: Any = None) -> Any:
+    json_method = getattr(request, "json", None)
+    if callable(json_method):
+        try:
+            return await json_method(default=default)
+        except TypeError:
+            try:
+                return await json_method()
+            except Exception:
+                return default
+        except Exception:
+            return default
+    get_json = getattr(request, "get_json", None)
+    if callable(get_json):
+        try:
+            return await get_json(silent=True) or default
+        except Exception:
+            return default
+    return default
+
+
+# ---- small data helpers ----
+
+
+def _plugin_version(plugin) -> str:
+    try:
+        from astrbot.core.star.star import star_map
+
+        metadata = star_map.get(type(plugin).__module__)
+        if metadata is not None and metadata.version:
+            return str(metadata.version)
+    except Exception:
+        metadata = None
+    return str(getattr(plugin, "version", None) or "unknown")
+
+
+def _astrbot_version() -> str | None:
+    try:
+        import astrbot
+
+        version = getattr(astrbot, "__version__", None)
+        return str(version) if version else None
+    except Exception:
+        return None
+
+
+def _absolute_url(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    if raw.startswith(("http://", "https://")):
+        return raw
+    if raw.startswith("//"):
+        return f"https:{raw}"
+    if raw.startswith("/"):
+        return f"{SITE_URL}{raw}"
+    return raw
+
+
+def normalize_game_url(raw: str | None) -> str | None:
+    """Accept only https online-fix.me URLs under /games/."""
+    if not isinstance(raw, str):
+        return None
+    raw = raw.strip()
+    if not raw or len(raw) > 500:
+        return None
+    if raw.startswith("/"):
+        raw = f"{SITE_URL}{raw}"
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not (
+        host == "online-fix.me" or host.endswith(".online-fix.me")
+    ):
+        return None
+    if parsed.username or parsed.password:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port not in (None, 443):
+        return None
+    if not parsed.path.startswith("/games/"):
+        return None
+    return urlunparse(("https", host, parsed.path, "", "", ""))
+
+
+def _seen_ids(plugin) -> set[str]:
+    try:
+        seen = plugin._load_seen()
+    except Exception:
+        return set()
+    ids = seen.get("onlinefix", []) if isinstance(seen, dict) else []
+    return {str(item) for item in ids} if isinstance(ids, list) else set()
+
+
+def _game_to_dict(game, seen_ids: set[str]) -> dict[str, Any]:
+    return {
+        "id": str(game.id),
+        "title": game.title,
+        "url": _absolute_url(game.url),
+        "poster_url": _absolute_url(game.poster_url),
+        "post_date": game.post_date,
+        "release_date": game.release_date,
+        "platforms": list(game.platforms or []),
+        "modes": list(game.modes or []),
+        "update_info": game.update_info,
+        "is_new": str(game.id) not in seen_ids,
+    }
+
+
+async def _load_subscriptions(plugin) -> list[dict]:
+    try:
+        raw = await plugin.get_kv_data("subscriptions", [])
+    except Exception:
+        raw = []
+    return plugin._normalize_subscriptions(raw)
+
+
+# ---- status ----
+
+
+async def _build_status(plugin) -> dict[str, Any]:
+    subscriptions = await _load_subscriptions(plugin)
+    seen_ids = _seen_ids(plugin)
+    status = plugin.status
+    snapshot = status.snapshot()
+    last_check = snapshot.get("last_check")
+    now = datetime.now().astimezone()
+
+    accounts = []
+    for inst in plugin._aiocqhttp_insts():
+        platform_id = plugin._inst_platform_id(inst)
+        bot = plugin._inst_bot(inst)
+        state = getattr(inst, "status", None)
+        accounts.append(
+            {
+                "platform_id": platform_id,
+                "self_id": str(getattr(bot, "self_id", "") or "") or None,
+                "status": getattr(state, "value", None) or "unknown",
+                "subscriptions": sum(
+                    1
+                    for item in subscriptions
+                    if item.get("platform_id") == platform_id
+                ),
+            }
+        )
+
+    next_check_at = snapshot.get("next_check_at")
+    seconds_until_next = None
+    if next_check_at:
+        try:
+            seconds_until_next = max(
+                0,
+                int(
+                    (
+                        datetime.fromisoformat(next_check_at) - now
+                    ).total_seconds()
+                ),
+            )
+        except (TypeError, ValueError):
+            seconds_until_next = None
+
+    config_keys = (
+        "request_timeout",
+        "game_check_interval",
+        "max_display_items",
+        "send_game_posters",
+        "fallback_to_text_on_upload_failure",
+    )
+    config = {key: plugin.config.get(key) for key in config_keys}
+
+    return {
+        "server_time": now.isoformat(timespec="seconds"),
+        "plugin": {
+            "name": plugin._plugin_name(),
+            "display_name": "getGameInfo",
+            "version": _plugin_version(plugin),
+            "astrbot_version": _astrbot_version(),
+        },
+        "runtime": {
+            "started_at": snapshot.get("started_at"),
+            "uptime_seconds": snapshot.get("uptime_seconds", 0),
+            "scraper_ready": getattr(plugin, "_scraper", None) is not None,
+            "poll_task_running": bool(
+                getattr(plugin, "_poll_new_task", None)
+                and not plugin._poll_new_task.done()
+            ),
+            "checking": bool(
+                getattr(plugin, "_check_lock", None)
+                and plugin._check_lock.locked()
+            )
+            or bool(snapshot.get("checking")),
+        },
+        "schedule": {
+            "interval_seconds": max(
+                int(plugin.config.get("game_check_interval", 21600) or 21600),
+                1800,
+            ),
+            "next_check_at": next_check_at,
+            "seconds_until_next": seconds_until_next,
+        },
+        "last_check": last_check,
+        "counts": {
+            "subscriptions": len(subscriptions),
+            "groups": len({item["group_id"] for item in subscriptions}),
+            "accounts": len(accounts),
+            "tracked_games": len(seen_ids),
+            "today": snapshot.get("today", {}),
+        },
+        "accounts": accounts,
+        "config": config,
+        "health": {
+            "site": SITE_URL,
+            # No extra request is made for the status poll; the last check is
+            # the health signal. A dedicated probe can be added later.
+            "reachable": last_check.get("ok") if last_check else None,
+            "latency_ms": last_check.get("duration_ms") if last_check else None,
+            "checked_at": last_check.get("finished_at") if last_check else None,
+        },
+    }
+
+
+# ---- API registration ----
+
+
+def register_view_apis(plugin, context) -> None:
+    """Register the read-only view API. Safe to call more than once."""
+    register = getattr(context, "register_web_api", None)
+    if not callable(register):
+        return
+
+    games_cache: dict[str, Any] = {
+        "at": 0.0,
+        "page": 0,
+        "items": [],
+        "total_pages": 1,
+        "fetched_at": None,
+    }
+    manual_cooldown = {"at": 0.0}
+
+    async def api_status():
+        return json_response(await _build_status(plugin))
+
+    async def api_subscriptions():
+        subscriptions = await _load_subscriptions(plugin)
+        items = []
+        states = []
+        for subscription in subscriptions:
+            try:
+                evaluation = await plugin.evaluate_subscription(subscription)
+            except Exception as exc:
+                logger.warning("评估订阅路由失败: %s", type(exc).__name__)
+                evaluation = {
+                    "state": "unknown",
+                    "platform_id": subscription.get("platform_id"),
+                    "bot": None,
+                }
+            state = evaluation.get("state", "no_eligible_account")
+            states.append(state)
+            resolved = evaluation.get("platform_id")
+            bot = evaluation.get("bot")
+            items.append(
+                {
+                    "group_id": subscription["group_id"],
+                    "platform_id": subscription.get("platform_id"),
+                    "self_id": subscription.get("self_id"),
+                    "resolved_platform_id": resolved,
+                    "state": state,
+                    "state_label": STATE_LABELS.get(state, "未知状态"),
+                    "will_migrate": bool(
+                        resolved
+                        and subscription.get("platform_id")
+                        and resolved != subscription.get("platform_id")
+                    ),
+                    "account_self_id": (
+                        str(getattr(bot, "self_id", "") or "") or None
+                        if bot is not None
+                        else None
+                    ),
+                    "last_delivery": plugin.status.get_delivery(
+                        subscription.get("platform_id") or resolved,
+                        subscription["group_id"],
+                    ),
+                }
+            )
+        summary = {
+            "total": len(items),
+            "ready": states.count("ready"),
+            "legacy": states.count("legacy"),
+        }
+        summary["blocked"] = summary["total"] - summary["ready"] - summary["legacy"]
+        return json_response({"items": items, "summary": summary})
+
+    async def api_events():
+        limit = _query_get("limit", 100, int) or 100
+        category = str(_query_get("category", "all") or "all")
+        level = _query_get("level", None)
+        query = _query_get("q", None)
+        if category not in ("all", "check", "push", "error"):
+            category = "all"
+        if level not in (None, "info", "warning", "error"):
+            level = None
+        return json_response(
+            {
+                "items": plugin.status.events(
+                    limit=max(1, min(int(limit), MAX_EVENT_LIMIT)),
+                    category=category,
+                    level=level,
+                    query=str(query) if query else None,
+                )
+            }
+        )
+
+    async def api_games():
+        page = int(_query_get("page", 1, int) or 1)
+        page = max(1, min(page, 50))
+        default_limit = int(plugin.config.get("max_display_items", 21) or 21)
+        limit = int(_query_get("limit", default_limit, int) or default_limit)
+        limit = max(1, min(limit, MAX_LIST_LIMIT))
+        force = str(_query_get("force", "0") or "0").lower() in ("1", "true", "yes")
+
+        now_mono = time.monotonic()
+        cached = bool(
+            not force
+            and games_cache["items"]
+            and games_cache["page"] == page
+            and now_mono - games_cache["at"] < GAME_CACHE_TTL
+        )
+        if not cached:
+            if getattr(plugin, "_scraper", None) is None:
+                return error_response("插件尚未完成初始化", status_code=503)
+            try:
+                games, total_pages = await plugin._scraper.fetch_list(page)
+            except Exception as exc:
+                logger.warning("获取游戏列表失败: %s", type(exc).__name__)
+                return error_response("获取游戏列表失败，请稍后重试", status_code=502)
+            seen = _seen_ids(plugin)
+            games_cache.update(
+                {
+                    "at": now_mono,
+                    "page": page,
+                    "items": [_game_to_dict(game, seen) for game in games],
+                    "total_pages": total_pages,
+                    "fetched_at": datetime.now().astimezone().isoformat(
+                        timespec="seconds"
+                    ),
+                }
+            )
+
+        return json_response(
+            {
+                "page": page,
+                "total_pages": games_cache["total_pages"],
+                "cached": cached,
+                "fetched_at": games_cache["fetched_at"],
+                "items": games_cache["items"][:limit],
+            }
+        )
+
+    async def api_search_games():
+        query = str(_query_get("q", "") or "").strip()
+        if not 1 <= len(query) <= 100:
+            return error_response("搜索关键词长度需在 1-100 个字符之间")
+        if getattr(plugin, "_scraper", None) is None:
+            return error_response("插件尚未完成初始化", status_code=503)
+        try:
+            games, total_pages = await plugin._scraper.search(query)
+        except Exception as exc:
+            logger.warning("搜索游戏失败: %s", type(exc).__name__)
+            return error_response("搜索失败，请稍后重试", status_code=502)
+        seen = _seen_ids(plugin)
+        return json_response(
+            {
+                "query": query,
+                "total_pages": total_pages,
+                "items": [
+                    _game_to_dict(game, seen) for game in games[:MAX_LIST_LIMIT]
+                ],
+            }
+        )
+
+    async def api_game_detail():
+        url = normalize_game_url(_query_get("url", None))
+        if url is None:
+            return error_response("只允许查询 online-fix.me 的游戏详情页")
+        if getattr(plugin, "_scraper", None) is None:
+            return error_response("插件尚未完成初始化", status_code=503)
+        try:
+            coop, multi = await plugin._scraper.fetch_player_counts(url)
+        except Exception as exc:
+            logger.warning("获取玩家人数失败: %s", type(exc).__name__)
+            return error_response("获取游戏详情失败，请稍后重试", status_code=502)
+        return json_response(
+            {
+                "url": url,
+                "coop_players": coop,
+                "multi_players": multi,
+            }
+        )
+
+    async def api_check():
+        payload = await _json_body(default={})
+        if not isinstance(payload, dict):
+            payload = {}
+        mode = str(payload.get("mode", "dry_run") or "dry_run")
+        if mode != "dry_run":
+            return error_response("当前版本仅支持 dry_run 检查", status_code=400)
+        if getattr(plugin, "_scraper", None) is None:
+            return error_response("插件尚未完成初始化", status_code=503)
+        if plugin._check_lock.locked():
+            return error_response("已有检查正在进行", status_code=409)
+        now_mono = time.monotonic()
+        if now_mono - manual_cooldown["at"] < MANUAL_CHECK_COOLDOWN:
+            return error_response("操作过于频繁，请稍后再试", status_code=429)
+        manual_cooldown["at"] = now_mono
+        try:
+            result = await plugin.run_check(trigger="manual", dry_run=True)
+        except CheckBusyError:
+            return error_response("已有检查正在进行", status_code=409)
+        except Exception as exc:
+            logger.warning("手动检查异常: %s", type(exc).__name__)
+            return error_response("检查失败，请查看插件日志", status_code=500)
+        if not result.get("ok"):
+            return error_response(
+                str(result.get("error") or "检查失败"), status_code=502
+            )
+        return json_response(result)
+
+    routes = [
+        (f"/{PLUGIN_NAME}/status", api_status, ["GET"], "Get plugin status"),
+        (
+            f"/{PLUGIN_NAME}/subscriptions",
+            api_subscriptions,
+            ["GET"],
+            "List game subscriptions",
+        ),
+        (f"/{PLUGIN_NAME}/events", api_events, ["GET"], "List recent events"),
+        (f"/{PLUGIN_NAME}/games", api_games, ["GET"], "List latest games"),
+        (
+            f"/{PLUGIN_NAME}/games/search",
+            api_search_games,
+            ["GET"],
+            "Search games",
+        ),
+        (
+            f"/{PLUGIN_NAME}/games/detail",
+            api_game_detail,
+            ["GET"],
+            "Get game player counts",
+        ),
+        (f"/{PLUGIN_NAME}/check", api_check, ["POST"], "Run a dry-run check"),
+    ]
+    for route, handler, methods, desc in routes:
+        try:
+            register(route, handler, methods, desc)
+        except Exception as exc:
+            logger.warning("注册视图 API %s 失败: %s", route, exc)

@@ -55,3 +55,12 @@ detail=highway upload transport failed ... TCP connect timeout
 如需恢复封面上传，仍需检查 SnowLuma 所在机器 / 容器到本次实际 Highway host / port 的出站 TCP 连接。可临时开启 SnowLuma 的 trace，提取 `highway_put_start` 的 host、port；不要公开整份 trace、headHex、Cookie、会话密钥或 OneBot access token。
 
 无需为了插件升级专门收集这些信息；只有继续排查底层上传连接失败时才需要。调大插件 `request_timeout` 只影响网站 HTTP 请求，不改变 SnowLuma 的 Highway 建连逻辑。
+
+## WebUI 运行状态视图（v0.0.4）
+
+1. 在 AstrBot 插件详情页打开「运行状态」视图，确认标题与描述来自 `.astrbot-plugin/i18n/zh-CN.json`。
+2. 概览应显示下次检查时间、上次检查结果、订阅数、追踪游戏数、账号列表和最近事件；明暗主题切换、窄屏（≤480px）可用。
+3. 订阅页应能区分「可推送」「插件未启用」「平台未加载」「旧订阅待迁移」，并显示最近一次投递结果。
+4. 点击「仅检查」：群内不应收到消息，`data/plugin_data/astrbot_plugin_getGameInfo/seen_games.json` 内容不应变化；再次点击应提示操作过于频繁。
+5. 游戏页首次打开会请求站点；搜索、详情人数和「新」标记正常，封面加载失败时显示占位块。
+6. 事件页应出现检查、订阅、推送失败/降级记录；错误文本不包含 URL、base64 或本地路径。

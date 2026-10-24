@@ -1,0 +1,14 @@
+{
+  "views": {
+    "status": {
+      "title": "运行状态",
+      "description": "查看轮询计划、订阅路由、推送结果与最近事件"
+    }
+  },
+  "pages": {
+    "status": {
+      "title": "运行状态",
+      "description": "查看轮询计划、订阅路由、推送结果与最近事件"
+    }
+  }
+}

@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>getGameInfo 运行状态</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="topbar-main">
+          <div class="title-block">
+            <div class="title-line">
+              <h1 id="page-title">getGameInfo 运行状态</h1>
+              <span id="runtime-pill" class="pill pill-muted">加载中</span>
+            </div>
+            <p id="subtitle" class="subtitle">正在连接 AstrBot…</p>
+          </div>
+          <div class="topbar-actions">
+            <button id="refresh-button" class="button button-ghost" type="button">
+              刷新
+            </button>
+            <button id="check-button" class="button button-primary" type="button">
+              仅检查
+            </button>
+          </div>
+        </div>
+        <div class="topbar-meta">
+          <span id="version-line" class="meta-text"></span>
+          <span id="countdown-line" class="meta-text"></span>
+          <span id="updated-line" class="meta-text"></span>
+        </div>
+      </header>
+
+      <div id="error-banner" class="banner hidden" role="alert">
+        <span id="error-text"></span>
+        <button id="retry-button" class="button button-small" type="button">
+          重试
+        </button>
+      </div>
+
+      <section id="kpi-row" class="kpi-row" aria-label="关键指标"></section>
+
+      <nav class="tabs" id="tabs" aria-label="页面切换">
+        <button class="tab is-active" data-tab="overview" type="button">概览</button>
+        <button class="tab" data-tab="subscriptions" type="button">
+          订阅 <span id="tab-subscription-count" class="tab-count"></span>
+        </button>
+        <button class="tab" data-tab="games" type="button">游戏</button>
+        <button class="tab" data-tab="events" type="button">事件</button>
+      </nav>
+
+      <main id="content" class="content">
+        <div class="loading-block">正在加载状态…</div>
+      </main>
+
+      <footer class="footer">
+        <span>状态与事件每 10 秒自动刷新</span>
+        <span id="footer-status" class="meta-text"></span>
+      </footer>
+    </div>
+    <div id="toast-region" class="toast-region" aria-live="polite"></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

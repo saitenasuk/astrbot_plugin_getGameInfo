@@ -4,6 +4,8 @@ import asyncio
 import base64
 import io
 import json
+import time
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -14,9 +16,11 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
+from . import webui
 from .models import GameBrief
 from .onebot_sender import OneBotActionError, call_action, sanitize_detail, text_only_payload
 from .scraper import BaseGameScraper, OnlineFixScraper
+from .status import CheckBusyError, RuntimeState
 
 SCRAPER_REGISTRY: dict[str, type[BaseGameScraper]] = {"onlinefix": OnlineFixScraper}
 
@@ -34,12 +38,17 @@ class GameDownPlugin(Star):
         self._scraper: BaseGameScraper | None = None
         self._poll_new_task: asyncio.Task | None = None
         self._image_client = httpx.AsyncClient(timeout=config.get("request_timeout", 30))
+        self.status = RuntimeState()
+        self._check_lock = asyncio.Lock()
+        webui.register_view_apis(self, context)
 
     async def initialize(self):
         cls = SCRAPER_REGISTRY.get("onlinefix", OnlineFixScraper)
         self._scraper = cls(
             timeout=self.config.get("request_timeout", 30),
         )
+        self.status.attach_storage(self._data_dir() / "status.json")
+        self.status.load()
         self._poll_new_task = asyncio.create_task(self._poll_new_games())
         logger.info(f"game_down 已就绪（{self._scraper.site_name}）")
 
@@ -53,7 +62,9 @@ class GameDownPlugin(Star):
         try:
             if self._scraper:
                 await self._scraper.close()
+                self._scraper = None
         finally:
+            self.status.save()
             await self._image_client.aclose()
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -195,6 +206,13 @@ class GameDownPlugin(Star):
         ]
         subscriptions.append(record)
         await self.put_kv_data("subscriptions", subscriptions)
+        self.status.add_event(
+            "info",
+            "subscribe",
+            f"群 {record['group_id']} 新增订阅",
+            group_id=record["group_id"],
+            platform_id=platform_id,
+        )
         yield event.plain_result("已订阅新游戏推送。\n发送 /game unsubscribe 取消。")
 
     async def _cmd_unsubscribe(self, event: AstrMessageEvent):
@@ -208,9 +226,49 @@ class GameDownPlugin(Star):
         if len(remaining) == len(subscriptions):
             yield event.plain_result("本群未订阅。"); return
         await self.put_kv_data("subscriptions", remaining)
+        self.status.add_event(
+            "info",
+            "unsubscribe",
+            f"群 {gid} 取消订阅",
+            group_id=str(gid),
+        )
         yield event.plain_result("已取消新游戏推送。")
 
     # ---- 新游戏轮询 ----
+
+    @staticmethod
+    def _data_dir() -> Path:
+        return (
+            Path(get_astrbot_data_path())
+            / "plugin_data"
+            / "astrbot_plugin_getGameInfo"
+        )
+
+    def _load_seen(self) -> dict:
+        seen_path = self._data_dir() / "seen_games.json"
+        if not seen_path.exists():
+            return {}
+        try:
+            payload = json.loads(seen_path.read_text("utf-8") or "{}")
+        except (OSError, ValueError) as exc:
+            logger.warning("读取 seen_games.json 失败: %s", exc)
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _save_seen(self, seen: dict) -> None:
+        data_dir = self._data_dir()
+        seen_path = data_dir / "seen_games.json"
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+            seen_path.write_text(json.dumps(seen, ensure_ascii=False, indent=2))
+        except OSError as exc:
+            logger.warning("写入 seen_games.json 失败: %s", exc)
+
+    def _check_interval(self) -> int:
+        try:
+            return max(int(self.config.get("game_check_interval", 21600)), 1800)
+        except (TypeError, ValueError):
+            return 21600
 
     async def _poll_new_games(self):
         """定时轮询新游戏，按当前时钟时间对齐整点执行。
@@ -218,94 +276,216 @@ class GameDownPlugin(Star):
         例如 interval=7200（2小时），则在 00:00、02:00、04:00… 执行，
         而非基于插件启动时间偏移。
         """
-        import time
-
-        interval = max(self.config.get("game_check_interval", 21600), 1800)
-
         while True:
-            # 计算距离下一个对齐时刻的秒数
+            interval = self._check_interval()
             now = time.time()
             next_tick = ((now // interval) + 1) * interval
-            wait = next_tick - now
-            logger.info(f"下次新游戏检查将在 {wait:.0f} 秒后（{time.strftime('%H:%M:%S', time.localtime(next_tick))}）")
-            await asyncio.sleep(wait)
-
+            wait = max(0.0, next_tick - now)
+            self.status.next_check_at = datetime.fromtimestamp(
+                next_tick
+            ).astimezone().isoformat(timespec="seconds")
+            logger.info(
+                "下次新游戏检查将在 %.0f 秒后（%s）",
+                wait,
+                time.strftime("%H:%M:%S", time.localtime(next_tick)),
+            )
             try:
+                await asyncio.sleep(wait)
                 subs: list = await self.get_kv_data("subscriptions", [])
                 if subs:
-                    games, _ = await self._scraper.fetch_list(1)
-                    if games:
-                        await self._push_new_games(subs, games)
+                    await self.run_check(trigger="schedule")
             except asyncio.CancelledError:
-                return
+                raise
             except Exception:
                 logger.exception("新游戏轮询异常")
 
-    async def _push_new_games(self, subs: list, games):
-        data_dir = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_getGameInfo"
-        seen_path = data_dir / "seen_games.json"
-        seen = json.loads(seen_path.read_text("utf-8") or "{}") if seen_path.exists() else {}
+    async def run_check(self, trigger: str = "schedule", dry_run: bool = False) -> dict:
+        """Run one check. Used by the scheduler and the WebUI."""
+        if self._scraper is None:
+            return {
+                "mode": "dry_run" if dry_run else "push",
+                "ok": False,
+                "error": "插件尚未完成初始化",
+            }
+        if self._check_lock.locked():
+            raise CheckBusyError("已有检查正在进行")
 
+        async with self._check_lock:
+            started = time.monotonic()
+            self.status.start_check(trigger=trigger, dry_run=dry_run)
+            try:
+                games, _ = await self._scraper.fetch_list(1)
+                seen = self._load_seen()
+                old_ids = seen.get("onlinefix", []) if isinstance(seen, dict) else []
+                baseline_missing = not bool(old_ids)
+                new_games = (
+                    []
+                    if baseline_missing
+                    else [game for game in games if game.id not in old_ids]
+                )
+
+                if dry_run:
+                    duration_ms = int((time.monotonic() - started) * 1000)
+                    record = self.status.finish_check(
+                        ok=True,
+                        trigger=trigger,
+                        dry_run=True,
+                        duration_ms=duration_ms,
+                        games_seen=len(games),
+                        new_games=len(new_games),
+                        baseline_missing=baseline_missing,
+                    )
+                    return {
+                        "mode": "dry_run",
+                        "ok": True,
+                        "duration_ms": duration_ms,
+                        "games_seen": len(games),
+                        "baseline_missing": baseline_missing,
+                        "new_games": [
+                            {"id": game.id, "title": game.title}
+                            for game in new_games
+                        ],
+                        "finished_at": record.get("finished_at"),
+                    }
+
+                subs = await self.get_kv_data("subscriptions", [])
+                summary = await self._push_new_games(subs, games, new_games)
+                duration_ms = int((time.monotonic() - started) * 1000)
+                self.status.finish_check(
+                    ok=True,
+                    trigger=trigger,
+                    dry_run=False,
+                    duration_ms=duration_ms,
+                    games_seen=len(games),
+                    new_games=len(new_games),
+                    pushes=summary["pushes"],
+                    failures=summary["failures"],
+                    downgraded=summary["downgraded"],
+                    skipped=summary["skipped"],
+                    baseline_missing=baseline_missing,
+                )
+                if new_games:
+                    self.status.add_event(
+                        "info",
+                        "new_games",
+                        f"发现 {len(new_games)} 款新游戏",
+                        count=len(new_games),
+                    )
+                return {
+                    "mode": "push",
+                    "ok": True,
+                    "duration_ms": duration_ms,
+                    "games_seen": len(games),
+                    "baseline_missing": baseline_missing,
+                    **summary,
+                }
+            except asyncio.CancelledError:
+                self.status.checking = False
+                raise
+            except Exception as exc:
+                duration_ms = int((time.monotonic() - started) * 1000)
+                message = sanitize_detail(
+                    f"{type(exc).__name__}: {exc}"
+                ) or type(exc).__name__
+                self.status.finish_check(
+                    ok=False,
+                    trigger=trigger,
+                    dry_run=dry_run,
+                    duration_ms=duration_ms,
+                    error=message,
+                )
+                logger.warning("新游戏检查失败: %s", message)
+                return {
+                    "mode": "dry_run" if dry_run else "push",
+                    "ok": False,
+                    "error": message,
+                    "duration_ms": duration_ms,
+                }
+
+    async def _push_new_games(
+        self, subs: list, games, new_games: list[GameBrief] | None = None
+    ) -> dict:
+        seen = self._load_seen()
         current_ids = [g.id for g in games]
-        old_ids = seen.get("onlinefix", [])
+        old_ids = seen.get("onlinefix", []) if isinstance(seen, dict) else []
+        summary: dict = {
+            "new_games": [],
+            "pushes": 0,
+            "failures": 0,
+            "downgraded": 0,
+            "skipped": 0,
+        }
+
         if not old_ids:
             seen["onlinefix"] = current_ids
-            try:
-                data_dir.mkdir(parents=True, exist_ok=True)
-                seen_path.write_text(json.dumps(seen, ensure_ascii=False, indent=2))
-            except Exception as e:
-                logger.warning(f"写入 seen_games.json 失败: {e}")
-            return
+            self._save_seen(seen)
+            summary["baseline_initialized"] = True
+            return summary
 
-        new_ids = [i for i in current_ids if i not in old_ids]
-        if not new_ids:
-            return
-
-        new_games = [g for g in games if g.id in new_ids]
+        if new_games is None:
+            new_games = [g for g in games if g.id not in old_ids]
+        if not new_games:
+            return summary
+        summary["new_games"] = [
+            {"id": game.id, "title": game.title} for game in new_games
+        ]
 
         # One AstrBot can run several OneBot accounts that are all members of
         # the same group. Resolve each subscription to the account that owns
         # it; sending through the first account may use one that has this
         # plugin disabled in its bound config profile.
         subscriptions = self._normalize_subscriptions(subs)
-        targets: dict[int, tuple[object, list[str]]] = {}
+        targets: dict[int, tuple[object, list[dict]]] = {}
         for subscription in subscriptions:
             bot = await self._resolve_subscription_bot(subscription)
             if bot is None:
+                summary["skipped"] += 1
                 continue
-            gids = targets.setdefault(id(bot), (bot, []))[1]
-            if subscription["group_id"] not in gids:
-                gids.append(subscription["group_id"])
+            entries = targets.setdefault(id(bot), (bot, []))[1]
+            if not any(
+                item["group_id"] == subscription["group_id"] for item in entries
+            ):
+                entries.append(subscription)
+
+        if summary["skipped"]:
+            self.status.add_event(
+                "warning",
+                "push_skipped",
+                f"{summary['skipped']} 个订阅没有可用的推送账号",
+                count=summary["skipped"],
+            )
 
         if not targets:
             logger.warning("没有可用的订阅机器人账号，本次新游戏推送已跳过")
-            return
+            return summary
 
         if len(new_games) == 1:
-            g = new_games[0]
-            msg = await self._card_segments(g)
+            game = new_games[0]
+            msg = await self._card_segments(game)
             msg[-1]["data"]["text"] = (
-                f"新游戏上架！\n\n{self._fmt_card(g)}\n\n发送 /game info {g.title[:20]} 查看详情"
+                f"新游戏上架！\n\n{self._fmt_card(game)}\n\n"
+                f"发送 /game info {game.title[:20]} 查看详情"
             )
-            for bot, gids in targets.values():
-                for gid in gids:
-                    try:
-                        await self._send_group_with_fallback(
-                            bot, "send_group_msg", int(gid), message=msg,
-                        )
-                    except OneBotActionError as e:
-                        logger.warning("推送新游戏到群 %s 失败: %s", gid, e.diagnostic())
-                    except Exception as e:
-                        logger.warning("推送新游戏到群 %s 异常: %s", gid, type(e).__name__)
+            for bot, entries in targets.values():
+                for subscription in entries:
+                    await self._push_one(
+                        bot, subscription, "send_group_msg", message=msg,
+                        summary=summary,
+                    )
         else:
             # Posters are downloaded once and shared by every account.
-            cards = [await self._card_segments(g) for g in new_games]
-            for bot, gids in targets.values():
+            cards = [await self._card_segments(game) for game in new_games]
+            for bot, entries in targets.values():
                 self_id = await self._bot_self_id(bot)
                 if not self_id:
                     logger.warning(
-                        "无法确定推送账号，跳过 %s 个群的转发推送", len(gids),
+                        "无法确定推送账号，跳过 %s 个群的转发推送", len(entries),
                     )
+                    summary["failures"] += len(entries)
+                    for subscription in entries:
+                        self._record_failure(
+                            subscription, "无法确定推送账号",
+                        )
                     continue
                 nodes = [
                     {"type": "node", "data": {
@@ -313,19 +493,36 @@ class GameDownPlugin(Star):
                     }}
                     for content in cards
                 ]
-                for gid in gids:
+                for subscription in entries:
+                    sent = await self._push_one(
+                        bot, subscription, "send_group_forward_msg",
+                        messages=nodes, summary=summary,
+                    )
+                    if not sent:
+                        continue
+                    gid = subscription["group_id"]
                     try:
-                        await self._send_group_with_fallback(
-                            bot, "send_group_forward_msg", int(gid), messages=nodes,
+                        await call_action(
+                            bot,
+                            "send_group_msg",
+                            group_id=int(gid),
+                            message=[{
+                                "type": "text",
+                                "data": {"text":
+                                    f"新游戏上架 Online-Fix.me（{len(new_games)} 款）\n"
+                                    "发送 /game info <游戏名> 查看详情"},
+                            }],
                         )
-                        await call_action(bot, "send_group_msg", group_id=int(gid), message=[{
-                            "type": "text", "data": {"text":
-                                f"新游戏上架 Online-Fix.me（{len(new_games)} 款）\n发送 /game info <游戏名> 查看详情"},
-                        }])
-                    except OneBotActionError as e:
-                        logger.warning("推送新游戏到群 %s 失败: %s", gid, e.diagnostic())
-                    except Exception as e:
-                        logger.warning("推送新游戏到群 %s 异常: %s", gid, type(e).__name__)
+                    except OneBotActionError as exc:
+                        logger.warning(
+                            "推送新游戏汇总到群 %s 失败: %s", gid, exc.diagnostic()
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "推送新游戏汇总到群 %s 异常: %s",
+                            gid,
+                            type(exc).__name__,
+                        )
 
         # Persist migrations from legacy group-id-only entries.
         try:
@@ -334,11 +531,75 @@ class GameDownPlugin(Star):
             logger.warning("保存订阅机器人信息失败", exc_info=True)
 
         seen["onlinefix"] = current_ids
+        self._save_seen(seen)
+        return summary
+
+    async def _push_one(
+        self,
+        bot,
+        subscription: dict,
+        action: str,
+        *,
+        summary: dict,
+        **payload,
+    ) -> bool:
+        group_id = subscription["group_id"]
+        platform_id = subscription.get("platform_id")
         try:
-            data_dir.mkdir(parents=True, exist_ok=True)
-            seen_path.write_text(json.dumps(seen, ensure_ascii=False, indent=2))
-        except Exception as e:
-            logger.warning(f"更新 seen_games.json 失败: {e}")
+            downgraded = await self._send_group_with_fallback(
+                bot, action, int(group_id), **payload,
+            )
+        except OneBotActionError as exc:
+            summary["failures"] += 1
+            self._record_failure(subscription, exc.reason)
+            self.status.add_event(
+                "warning",
+                "push_fail",
+                f"群 {group_id} 推送失败：{exc.reason}",
+                group_id=group_id,
+                platform_id=platform_id,
+                reason=exc.reason,
+                retcode=exc.retcode,
+            )
+            logger.warning("推送新游戏到群 %s 失败: %s", group_id, exc.diagnostic())
+            return False
+        except Exception as exc:
+            summary["failures"] += 1
+            self._record_failure(subscription, type(exc).__name__)
+            self.status.add_event(
+                "error",
+                "push_fail",
+                f"群 {group_id} 推送异常：{type(exc).__name__}",
+                group_id=group_id,
+                platform_id=platform_id,
+            )
+            logger.warning(
+                "推送新游戏到群 %s 异常: %s", group_id, type(exc).__name__
+            )
+            return False
+
+        summary["pushes"] += 1
+        if downgraded:
+            summary["downgraded"] += 1
+            self.status.add_event(
+                "warning",
+                "push_fallback",
+                f"群 {group_id} 图片上传失败，已改发纯文字",
+                group_id=group_id,
+                platform_id=platform_id,
+            )
+        self.status.record_delivery(
+            platform_id, group_id, ok=True, fallback=downgraded,
+        )
+        return True
+
+    def _record_failure(self, subscription: dict, error: str) -> None:
+        self.status.record_delivery(
+            subscription.get("platform_id"),
+            subscription["group_id"],
+            ok=False,
+            error=error,
+        )
 
     # ---- 工具 ----
 
@@ -472,9 +733,12 @@ class GameDownPlugin(Star):
             allowed = config.get("plugin_set", ["*"])
         except Exception:
             return await self._session_plugin_enabled(platform_id, group_id)
-        if isinstance(allowed, (list, tuple)):
-            if list(allowed) != ["*"] and self._plugin_name() not in allowed:
-                return False
+        if (
+            isinstance(allowed, (list, tuple))
+            and list(allowed) != ["*"]
+            and self._plugin_name() not in allowed
+        ):
+            return False
         return await self._session_plugin_enabled(platform_id, group_id)
 
     @staticmethod
@@ -500,8 +764,8 @@ class GameDownPlugin(Star):
             })
         return subscriptions
 
-    async def _resolve_subscription_bot(self, subscription: dict):
-        """Return the account that should deliver this group's push."""
+    async def evaluate_subscription(self, subscription: dict) -> dict:
+        """Read-only routing evaluation used by pushes and the WebUI."""
         group_id = subscription["group_id"]
         platform_id = subscription.get("platform_id")
 
@@ -509,21 +773,23 @@ class GameDownPlugin(Star):
             inst = self._find_platform(platform_id)
             if inst is not None:
                 if not await self._plugin_allowed(platform_id, group_id):
-                    logger.warning(
-                        "平台 %s 的配置文件未启用本插件，跳过群 %s 的推送",
-                        platform_id, group_id,
-                    )
-                    return None
+                    return {
+                        "state": "plugin_disabled",
+                        "platform_id": platform_id,
+                        "bot": None,
+                    }
                 bot = self._inst_bot(inst)
                 if bot is None:
-                    logger.warning(
-                        "平台 %s 的机器人实例不可用，跳过群 %s 的推送",
-                        platform_id, group_id,
-                    )
-                return bot
-            logger.warning(
-                "订阅所属平台 %s 未加载，将在其他账号中重新选择", platform_id,
-            )
+                    return {
+                        "state": "bot_unavailable",
+                        "platform_id": platform_id,
+                        "bot": None,
+                    }
+                return {
+                    "state": "ready",
+                    "platform_id": platform_id,
+                    "bot": bot,
+                }
 
         # Legacy entries (or a renamed platform) only have the group id, so
         # pick the first account whose profile still enables this plugin.
@@ -538,15 +804,65 @@ class GameDownPlugin(Star):
             if bot is not None:
                 candidates.append((candidate_id, bot))
         if candidates:
-            subscription["platform_id"] = candidates[0][0]
-            return candidates[0][1]
+            return {
+                "state": "legacy" if not platform_id else "platform_missing",
+                "platform_id": candidates[0][0],
+                "bot": candidates[0][1],
+            }
 
         if any(self._inst_platform_id(inst) for inst in self._aiocqhttp_insts()):
-            logger.warning("群 %s 没有启用本插件的机器人账号，跳过推送", group_id)
-            return None
+            return {
+                "state": "platform_missing" if platform_id else "no_eligible_account",
+                "platform_id": None,
+                "bot": None,
+            }
         # Custom/older adapters may not expose a platform id; keep the old
         # first-account behavior for them instead of dropping the push.
-        return self._get_bot()
+        bot = self._get_bot()
+        return {
+            "state": "ready" if bot is not None else "no_eligible_account",
+            "platform_id": platform_id,
+            "bot": bot,
+        }
+
+    async def _resolve_subscription_bot(self, subscription: dict):
+        """Return the account that should deliver this group's push."""
+        group_id = subscription["group_id"]
+        platform_id = subscription.get("platform_id")
+        evaluation = await self.evaluate_subscription(subscription)
+        state = evaluation["state"]
+        bot = evaluation["bot"]
+        resolved = evaluation["platform_id"]
+
+        if state == "plugin_disabled":
+            logger.warning(
+                "平台 %s 未启用本插件（配置文件或会话规则），跳过群 %s 的推送",
+                platform_id, group_id,
+            )
+            return None
+        if state == "platform_missing":
+            logger.warning(
+                "订阅所属平台 %s 未加载，将在其他账号中重新选择", platform_id,
+            )
+        elif state == "no_eligible_account":
+            logger.warning("群 %s 没有启用本插件的机器人账号，跳过推送", group_id)
+            return None
+        if bot is None:
+            logger.warning(
+                "平台 %s 的机器人实例不可用，跳过群 %s 的推送",
+                resolved or platform_id, group_id,
+            )
+            return None
+        if resolved and resolved != platform_id:
+            subscription["platform_id"] = resolved
+            self.status.add_event(
+                "info",
+                "migrate",
+                f"群 {group_id} 的订阅已迁移到 {resolved}",
+                group_id=group_id,
+                platform_id=resolved,
+            )
+        return bot
 
     async def _bot_self_id(self, bot) -> str | None:
         self_id = getattr(bot, "self_id", None)

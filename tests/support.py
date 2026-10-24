@@ -105,6 +105,24 @@ class FakeAdapter:
         return self.bot
 
 
+class FakeResponse:
+    """Stand-in for astrbot.api.web JSON responses in unit tests."""
+
+    def __init__(self, data, status_code=200):
+        self.data = data
+        self.status_code = status_code
+
+
+def json_response(data=None, *, status_code=200, headers=None):
+    return FakeResponse({} if data is None else data, status_code)
+
+
+def error_response(message, *, status_code=400, data=None, headers=None):
+    return FakeResponse(
+        {"status": "error", "message": message, "data": data}, status_code
+    )
+
+
 class FakeStar:
     def __init__(self, context):
         self.context = context
@@ -128,6 +146,7 @@ def load_plugin():
         "astrbot.api",
         "astrbot.api.event",
         "astrbot.api.star",
+        "astrbot.api.web",
         "astrbot.core",
         "astrbot.core.utils",
         "astrbot.core.utils.astrbot_path",
@@ -139,6 +158,9 @@ def load_plugin():
         stubs[name] = ModuleType(name)
     stubs["astrbot.api"].AstrBotConfig = dict
     stubs["astrbot.api"].logger = logging.getLogger("getgameinfo-tests")
+    stubs["astrbot.api.web"].json_response = json_response
+    stubs["astrbot.api.web"].error_response = error_response
+    stubs["astrbot.api.web"].request = None
     stubs["astrbot.api.event"].AstrMessageEvent = FakeEvent
     stubs["astrbot.api.event"].filter = SimpleNamespace(
         PermissionType=SimpleNamespace(ADMIN="admin"),
