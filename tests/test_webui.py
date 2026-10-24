@@ -6,7 +6,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from tests.support import FakeAdapter, FakeBot, FakeScraper, games, main
+from tests.support import (
+    HIGHWAY_ERROR,
+    ActionFailed,
+    FakeAdapter,
+    FakeBot,
+    FakeScraper,
+    games,
+    main,
+)
 
 webui = main.webui
 PLUGIN_PATH = f"/{webui.PLUGIN_NAME}"
@@ -77,14 +85,20 @@ class ViewApiTests(unittest.IsolatedAsyncioTestCase):
     def test_registers_all_routes(self):
         expected_methods = {
             f"{PLUGIN_PATH}/status": ["GET"],
+            f"{PLUGIN_PATH}/health": ["GET"],
+            f"{PLUGIN_PATH}/history": ["GET"],
+            f"{PLUGIN_PATH}/diagnostics": ["GET"],
+            f"{PLUGIN_PATH}/groups": ["GET"],
             f"{PLUGIN_PATH}/subscriptions": ["GET"],
             f"{PLUGIN_PATH}/events": ["GET"],
             f"{PLUGIN_PATH}/games": ["GET"],
             f"{PLUGIN_PATH}/games/search": ["GET"],
             f"{PLUGIN_PATH}/games/detail": ["GET"],
             f"{PLUGIN_PATH}/check": ["POST"],
+            f"{PLUGIN_PATH}/subscriptions/add": ["POST"],
             f"{PLUGIN_PATH}/subscriptions/remove": ["POST"],
             f"{PLUGIN_PATH}/subscriptions/test": ["POST"],
+            f"{PLUGIN_PATH}/maintenance/seen": ["POST"],
         }
         self.assertEqual(set(self.context.routes), set(expected_methods))
         for path, item in self.context.routes.items():
@@ -99,6 +113,7 @@ class ViewApiTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.status.next_check_at = (
             datetime.now().astimezone() + timedelta(hours=1)
         ).isoformat(timespec="seconds")
+        self.plugin.status.record_delivery("bot-a", "123", ok=True)
         self.plugin.status.last_check = {
             "ok": True,
             "trigger": "schedule",
@@ -118,7 +133,11 @@ class ViewApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(data["accounts"]), 2)
         self.assertTrue(data["config"]["send_game_posters"])
         self.assertEqual(data["health"]["reachable"], True)
+        self.assertEqual(data["health"]["status_code"], 200)
+        self.assertEqual(len(data["history"]), 7)
         self.assertIn("astrbot_version", data["plugin"])
+        by_account = {item["platform_id"]: item for item in data["accounts"]}
+        self.assertTrue(by_account["bot-a"]["last_delivery"]["ok"])
 
     async def test_subscriptions_reports_ready_legacy_and_blocked_states(self):
         self.plugin.kv["subscriptions"] = [
@@ -193,6 +212,9 @@ class ViewApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("send_group_msg", actions_a)
         self.assertEqual(self.bot_b.calls, [])
         self.assertFalse(self.plugin.status.last_check["dry_run"])
+        self.assertTrue(
+            any(event["kind"] == "push_ok" for event in self.plugin.status.events())
+        )
 
     async def test_push_check_requires_subscriptions(self):
         response = await self.call("/check", body={"mode": "push"})
@@ -333,6 +355,134 @@ class ViewApiTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(webui, "request", FakeRequest(body={"mode": "dry_run"})):
             response = await self.context.routes[f"{PLUGIN_PATH}/check"]["handler"]()
         self.assertEqual(response.status_code, 503)
+
+    async def test_health_and_history_endpoints(self):
+        health = await self.call("/health")
+        self.assertEqual(health.status_code, 200)
+        self.assertTrue(health.data["reachable"])
+        self.assertEqual(health.data["status_code"], 200)
+        history = await self.call("/history", query={"days": "3"})
+        self.assertEqual(len(history.data["days"]), 3)
+        self.assertIn("avg_duration_ms", history.data["days"][0])
+
+    async def test_diagnostics_contains_status_and_seen(self):
+        self.plugin.kv["subscriptions"] = [
+            {"group_id": "123", "platform_id": "bot-a", "self_id": "111"}
+        ]
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            main, "get_astrbot_data_path", return_value=directory
+        ):
+            data_dir = Path(directory) / "plugin_data" / "astrbot_plugin_getGameInfo"
+            data_dir.mkdir(parents=True)
+            (data_dir / "seen_games.json").write_text(
+                json.dumps({"onlinefix": ["1", "2"]})
+            )
+            response = await self.call("/diagnostics")
+        data = response.data
+        self.assertEqual(data["seen_games"], ["1", "2"])
+        self.assertIn("subscriptions", data)
+        self.assertIn("events", data)
+        self.assertIn("history", data)
+        self.assertNotIn("base64", json.dumps(data))
+
+    async def test_maintenance_reset_and_clear_seen(self):
+        self.plugin._scraper.results = games(2)
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            main, "get_astrbot_data_path", return_value=directory
+        ):
+            seen_path = (
+                Path(directory)
+                / "plugin_data"
+                / "astrbot_plugin_getGameInfo"
+                / "seen_games.json"
+            )
+            bad = await self.call(
+                "/maintenance/seen", body={"action": "reset", "confirm": "CLEAR"}
+            )
+            self.assertEqual(bad.status_code, 400)
+            reset = await self.call(
+                "/maintenance/seen", body={"action": "reset", "confirm": "RESET"}
+            )
+            self.assertEqual(reset.status_code, 200)
+            self.assertEqual(reset.data["tracked_games"], 2)
+            self.assertEqual(
+                json.loads(seen_path.read_text()), {"onlinefix": ["0", "1"]}
+            )
+            cleared = await self.call(
+                "/maintenance/seen", body={"action": "clear", "confirm": "CLEAR"}
+            )
+            self.assertEqual(cleared.status_code, 200)
+            self.assertTrue(json.loads(seen_path.read_text())["force_push_all"])
+
+    async def test_clear_seen_makes_next_push_send_all_games(self):
+        self.plugin.kv["subscriptions"] = [
+            {"group_id": "123", "platform_id": "bot-a", "self_id": "111"}
+        ]
+        self.plugin._scraper.results = games(2)
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            main, "get_astrbot_data_path", return_value=directory
+        ):
+            await self.call(
+                "/maintenance/seen", body={"action": "clear", "confirm": "CLEAR"}
+            )
+            summary = await self.plugin._push_new_games(
+                self.plugin.kv["subscriptions"], games(2)
+            )
+            self.assertEqual(summary["pushes"], 1)
+            seen = json.loads(
+                (
+                    Path(directory)
+                    / "plugin_data"
+                    / "astrbot_plugin_getGameInfo"
+                    / "seen_games.json"
+                ).read_text()
+            )
+            self.assertEqual(seen["onlinefix"], ["0", "1"])
+            self.assertNotIn("force_push_all", seen)
+
+    async def test_groups_and_add_subscription(self):
+        def handler(action, payload):
+            if action == "get_group_list":
+                return {"data": [{"group_id": 123, "group_name": "Group A"}]}
+
+        self.bot_a.handler = handler
+        groups = await self.call("/groups", query={"platform_id": "bot-a"})
+        self.assertEqual(groups.status_code, 200)
+        self.assertEqual(groups.data["items"], [{"group_id": "123", "group_name": "Group A"}])
+        added = await self.call(
+            "/subscriptions/add",
+            body={"group_id": "123", "platform_id": "bot-a"},
+        )
+        self.assertEqual(added.status_code, 200)
+        self.assertTrue(added.data["changed"])
+        self.assertEqual(self.plugin.kv["subscriptions"][0]["platform_id"], "bot-a")
+        missing = await self.call(
+            "/subscriptions/add",
+            body={"group_id": "456", "platform_id": "bot-a"},
+        )
+        self.assertEqual(missing.status_code, 400)
+
+    async def test_test_push_failure_records_detail_for_retry(self):
+        self.plugin.kv["subscriptions"] = [
+            {"group_id": "123", "platform_id": "bot-a", "self_id": "111"}
+        ]
+
+        def fail(action, payload):
+            if action == "send_group_msg":
+                raise ActionFailed(HIGHWAY_ERROR)
+
+        self.bot_a.handler = fail
+        response = await self.call(
+            "/subscriptions/test", body={"group_id": "123"}
+        )
+        self.assertEqual(response.status_code, 502)
+        event = next(
+            item
+            for item in self.plugin.status.events()
+            if item["kind"] == "push_test"
+        )
+        self.assertEqual(event["reason"], "HIGHWAY_CONNECT_TIMEOUT")
+        self.assertIn("TCP connect timeout", event["detail"])
 
     async def test_unexpected_values_still_produce_safe_status(self):
         response = await self.call("/status")

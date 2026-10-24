@@ -26,6 +26,7 @@ const KIND_LABELS = {
   subscribe: "新增订阅",
   unsubscribe: "取消订阅",
   migrate: "订阅迁移",
+  maintenance: "基线维护",
 };
 
 function eventMatches(event, category, query) {
@@ -45,7 +46,7 @@ function eventMatches(event, category, query) {
   return true;
 }
 
-export function renderEventItem(event) {
+export function renderEventItem(event, allowRetry = false) {
   const level = event.level || "info";
   const meta = [];
   if (event.group_id) meta.push(`群 ${event.group_id}`);
@@ -67,6 +68,20 @@ export function renderEventItem(event) {
           <span>${escapeHtml(KIND_LABELS[event.kind] || event.kind || "事件")}</span>
           ${meta.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}
         </div>
+        ${
+          event.detail
+            ? `<pre class="diagnostic-block">${escapeHtml(event.detail)}</pre>`
+            : ""
+        }
+        ${
+          allowRetry &&
+          event.kind === "push_test" &&
+          event.level !== "info" &&
+          event.group_id
+            ? `<button class="button button-small" type="button"
+                 data-retry-test="${escapeHtml(event.id)}">重试测试推送</button>`
+            : ""
+        }
       </div>
     </li>`;
 }
@@ -109,7 +124,7 @@ export function renderEvents(root, state, handlers) {
         ${
           filtered.length
             ? `<ul class="event-list">${filtered
-                .map(renderEventItem)
+                .map((event) => renderEventItem(event, true))
                 .join("")}</ul>`
             : emptyState("没有匹配的事件", "调整筛选条件，或等待下一次检查。")
         }
@@ -133,4 +148,12 @@ export function renderEvents(root, state, handlers) {
   root
     .querySelector('[data-action="refresh-events"]')
     ?.addEventListener("click", () => handlers.refreshEvents());
+  root.querySelectorAll("[data-retry-test]").forEach((button) => {
+    const event = filtered.find(
+      (item) => String(item.id) === button.getAttribute("data-retry-test"),
+    );
+    if (event) {
+      button.addEventListener("click", () => handlers.retryTestPush(event));
+    }
+  });
 }

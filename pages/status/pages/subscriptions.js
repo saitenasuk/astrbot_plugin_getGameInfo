@@ -28,10 +28,20 @@ export function renderSubscriptions(root, state, handlers) {
   const summary = data.summary || {};
 
   if (!items.length) {
-    root.innerHTML = emptyState(
-      "还没有订阅群",
-      "在群聊中由机器人执行 /game subscribe 后，这里会出现订阅记录。",
-    );
+    root.innerHTML = `
+      <div class="stack">
+        <div class="summary-chips">
+          <button class="button button-small button-primary" type="button"
+            data-action="add-subscription">添加订阅</button>
+        </div>
+        ${emptyState(
+          "还没有订阅群",
+          "可以从机器人所在群添加，或在群聊中由机器人执行 /game subscribe。",
+        )}
+      </div>`;
+    root
+      .querySelector('[data-action="add-subscription"]')
+      ?.addEventListener("click", () => handlers.openAddSubscription());
     return;
   }
 
@@ -42,6 +52,8 @@ export function renderSubscriptions(root, state, handlers) {
         <span class="badge badge-success">可推送 ${escapeHtml(summary.ready)}</span>
         ${summary.legacy ? `<span class="badge badge-warning">旧订阅 ${escapeHtml(summary.legacy)}</span>` : ""}
         ${summary.blocked ? `<span class="badge badge-danger">被阻止 ${escapeHtml(summary.blocked)}</span>` : ""}
+        <button class="button button-small button-primary" type="button"
+          data-action="add-subscription">添加订阅</button>
       </div>
       <div class="table-wrap">
         <table>
@@ -126,6 +138,9 @@ export function renderSubscriptions(root, state, handlers) {
       handlers.copy(button.getAttribute("data-copy-group")),
     );
   });
+  root
+    .querySelector('[data-action="add-subscription"]')
+    ?.addEventListener("click", () => handlers.openAddSubscription());
   root.querySelectorAll("[data-sub-action]").forEach((button) => {
     const item = items[Number(button.getAttribute("data-index"))];
     if (!item) return;

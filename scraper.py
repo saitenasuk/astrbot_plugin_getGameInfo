@@ -1,10 +1,11 @@
 """游戏网站爬虫"""
 
-import re
 import asyncio
 import logging
+import re
 import time
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Optional
 from urllib.parse import quote_plus
 
@@ -136,6 +137,35 @@ class OnlineFixScraper(BaseGameScraper):
             return resp.content.decode("utf-8")
         except UnicodeDecodeError:
             return resp.content.decode("windows-1251")
+
+    async def probe(self) -> dict:
+        """Lightweight site health probe with status code and latency."""
+        result = {
+            "site": self.site_url,
+            "reachable": False,
+            "status_code": None,
+            "latency_ms": None,
+            "checked_at": datetime.now().astimezone().isoformat(
+                timespec="seconds"
+            ),
+            "error": None,
+        }
+        try:
+            await self._rate_limit()
+            started = time.monotonic()
+            response = await self.client.get(
+                f"{self.site_url}/",
+                headers=self._headers(),
+                follow_redirects=True,
+            )
+            result["latency_ms"] = int((time.monotonic() - started) * 1000)
+            result["status_code"] = response.status_code
+            result["reachable"] = response.is_success
+            if not response.is_success:
+                result["error"] = f"HTTP {response.status_code}"
+        except Exception as exc:
+            result["error"] = type(exc).__name__
+        return result
 
     def clean_title(self, raw: str) -> str:
         return self._TITLE_STRIP_RE.sub("", raw).strip()

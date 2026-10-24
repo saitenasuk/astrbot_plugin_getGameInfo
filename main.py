@@ -180,40 +180,57 @@ class GameDownPlugin(Star):
 
     # ---- 订阅 ----
 
-    async def _cmd_subscribe(self, event: AstrMessageEvent):
-        gid = event.get_group_id()
-        if not gid:
-            yield event.plain_result("仅支持在群聊中订阅。"); return
+    async def add_subscription(
+        self,
+        group_id: str,
+        platform_id: str | None,
+        self_id: str | None = None,
+    ) -> bool:
+        """Add or move a group subscription. Returns False if unchanged."""
+        group_id = str(group_id)
         subscriptions = self._normalize_subscriptions(
             await self.get_kv_data("subscriptions", [])
         )
-        platform_id = self._event_platform_id(event)
-        record = {
-            "group_id": str(gid),
-            "platform_id": platform_id,
-            "self_id": str(event.get_self_id()) if event.get_self_id() else None,
-        }
         existing = next(
-            (item for item in subscriptions if item["group_id"] == record["group_id"]),
+            (item for item in subscriptions if item["group_id"] == group_id),
             None,
         )
         if existing is not None and existing.get("platform_id") == platform_id:
-            yield event.plain_result("本群已订阅。"); return
+            return False
         # A group is pushed by one account only: subscribing again (possibly
         # with another bot in the same group) moves the subscription here.
         subscriptions = [
-            item for item in subscriptions if item["group_id"] != record["group_id"]
+            item for item in subscriptions if item["group_id"] != group_id
         ]
-        subscriptions.append(record)
+        subscriptions.append(
+            {
+                "group_id": group_id,
+                "platform_id": platform_id,
+                "self_id": str(self_id) if self_id else None,
+            }
+        )
         await self.put_kv_data("subscriptions", subscriptions)
         self.status.add_event(
             "info",
             "subscribe",
-            f"群 {record['group_id']} 新增订阅",
-            group_id=record["group_id"],
+            f"群 {group_id} 新增订阅",
+            group_id=group_id,
             platform_id=platform_id,
         )
         self.status.save()
+        return True
+
+    async def _cmd_subscribe(self, event: AstrMessageEvent):
+        gid = event.get_group_id()
+        if not gid:
+            yield event.plain_result("仅支持在群聊中订阅。"); return
+        added = await self.add_subscription(
+            str(gid),
+            self._event_platform_id(event),
+            event.get_self_id(),
+        )
+        if not added:
+            yield event.plain_result("本群已订阅。"); return
         yield event.plain_result("已订阅新游戏推送。\n发送 /game unsubscribe 取消。")
 
     async def remove_subscription(
@@ -343,12 +360,18 @@ class GameDownPlugin(Star):
                 games, _ = await self._scraper.fetch_list(1)
                 seen = self._load_seen()
                 old_ids = seen.get("onlinefix", []) if isinstance(seen, dict) else []
-                baseline_missing = not bool(old_ids)
-                new_games = (
-                    []
-                    if baseline_missing
-                    else [game for game in games if game.id not in old_ids]
+                force_push_all = bool(
+                    seen.get("force_push_all") if isinstance(seen, dict) else False
                 )
+                baseline_missing = not bool(old_ids) and not force_push_all
+                if force_push_all:
+                    new_games = list(games)
+                elif baseline_missing:
+                    new_games = []
+                else:
+                    new_games = [
+                        game for game in games if game.id not in old_ids
+                    ]
 
                 if dry_run:
                     duration_ms = int((time.monotonic() - started) * 1000)
@@ -435,6 +458,9 @@ class GameDownPlugin(Star):
         seen = self._load_seen()
         current_ids = [g.id for g in games]
         old_ids = seen.get("onlinefix", []) if isinstance(seen, dict) else []
+        force_push_all = bool(
+            seen.get("force_push_all") if isinstance(seen, dict) else False
+        )
         summary: dict = {
             "new_games": [],
             "pushes": 0,
@@ -443,14 +469,18 @@ class GameDownPlugin(Star):
             "skipped": 0,
         }
 
-        if not old_ids:
+        if not old_ids and not force_push_all:
             seen["onlinefix"] = current_ids
             self._save_seen(seen)
             summary["baseline_initialized"] = True
             return summary
 
         if new_games is None:
-            new_games = [g for g in games if g.id not in old_ids]
+            new_games = (
+                list(games)
+                if force_push_all
+                else [g for g in games if g.id not in old_ids]
+            )
         if not new_games:
             return summary
         summary["new_games"] = [
@@ -558,6 +588,7 @@ class GameDownPlugin(Star):
             logger.warning("保存订阅机器人信息失败", exc_info=True)
 
         seen["onlinefix"] = current_ids
+        seen.pop("force_push_all", None)
         self._save_seen(seen)
         return summary
 
@@ -615,6 +646,14 @@ class GameDownPlugin(Star):
                 group_id=group_id,
                 platform_id=platform_id,
             )
+        self.status.add_event(
+            "info",
+            "push_ok",
+            f"群 {group_id} 推送成功",
+            group_id=group_id,
+            platform_id=platform_id,
+            downgraded=downgraded,
+        )
         self.status.record_delivery(
             platform_id, group_id, ok=True, fallback=downgraded,
         )

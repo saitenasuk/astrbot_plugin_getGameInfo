@@ -224,5 +224,16 @@ class FakeScraper:
         self.calls.append(("players", url))
         return 4, 8
 
+    async def probe(self):
+        self.calls.append(("probe",))
+        return {
+            "site": "https://online-fix.me",
+            "reachable": True,
+            "status_code": 200,
+            "latency_ms": 123,
+            "checked_at": "2026-10-24T14:00:00+08:00",
+            "error": None,
+        }
+
     async def close(self):
         self.closed = True

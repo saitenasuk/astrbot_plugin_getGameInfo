@@ -236,6 +236,19 @@ async def _build_status(plugin) -> dict[str, Any]:
     last_check = snapshot.get("last_check")
     now = datetime.now().astimezone()
 
+    deliveries: dict[str, dict] = {}
+    for item in subscriptions:
+        platform_id = item.get("platform_id")
+        delivery = status.get_delivery(platform_id, item["group_id"])
+        if delivery is None:
+            continue
+        key = platform_id or ""
+        current = deliveries.get(key)
+        if current is None or str(delivery.get("at", "")) > str(
+            current.get("at", "")
+        ):
+            deliveries[key] = delivery
+
     accounts = []
     for inst in plugin._aiocqhttp_insts():
         platform_id = plugin._inst_platform_id(inst)
@@ -251,6 +264,7 @@ async def _build_status(plugin) -> dict[str, Any]:
                     for item in subscriptions
                     if item.get("platform_id") == platform_id
                 ),
+                "last_delivery": deliveries.get(platform_id or ""),
             }
         )
 
@@ -316,6 +330,7 @@ async def _build_status(plugin) -> dict[str, Any]:
             "tracked_games": len(seen_ids),
             "today": snapshot.get("today", {}),
         },
+        "history": snapshot.get("history", []),
         "accounts": accounts,
         "config": config,
         "health": {
@@ -327,6 +342,57 @@ async def _build_status(plugin) -> dict[str, Any]:
             "checked_at": last_check.get("finished_at") if last_check else None,
         },
     }
+
+
+async def _build_subscription_items(plugin) -> tuple[list[dict], dict]:
+    subscriptions = await _load_subscriptions(plugin)
+    items = []
+    states = []
+    for subscription in subscriptions:
+        try:
+            evaluation = await plugin.evaluate_subscription(subscription)
+        except Exception as exc:
+            logger.warning("评估订阅路由失败: %s", type(exc).__name__)
+            evaluation = {
+                "state": "unknown",
+                "platform_id": subscription.get("platform_id"),
+                "bot": None,
+            }
+        state = evaluation.get("state", "no_eligible_account")
+        states.append(state)
+        resolved = evaluation.get("platform_id")
+        bot = evaluation.get("bot")
+        items.append(
+            {
+                "group_id": subscription["group_id"],
+                "platform_id": subscription.get("platform_id"),
+                "self_id": subscription.get("self_id"),
+                "resolved_platform_id": resolved,
+                "state": state,
+                "state_label": STATE_LABELS.get(state, "未知状态"),
+                "will_migrate": bool(
+                    resolved
+                    and subscription.get("platform_id")
+                    and resolved != subscription.get("platform_id")
+                ),
+                "account_self_id": (
+                    str(getattr(bot, "self_id", "") or "") or None
+                    if bot is not None
+                    else None
+                ),
+                "last_delivery": plugin.status.get_delivery(
+                    subscription.get("platform_id") or resolved,
+                    subscription["group_id"],
+                ),
+            }
+        )
+    summary = {
+        "total": len(items),
+        "ready": states.count("ready"),
+        "legacy": states.count("legacy"),
+    }
+    summary["blocked"] = summary["total"] - summary["ready"] - summary["legacy"]
+    return items, summary
 
 
 # ---- API registration ----
@@ -348,56 +414,12 @@ def register_view_apis(plugin, context) -> None:
     manual_cooldown = {"at": 0.0}
 
     async def api_status():
-        return json_response(await _build_status(plugin))
+        payload = await _build_status(plugin)
+        payload["health"] = await get_health()
+        return json_response(payload)
 
     async def api_subscriptions():
-        subscriptions = await _load_subscriptions(plugin)
-        items = []
-        states = []
-        for subscription in subscriptions:
-            try:
-                evaluation = await plugin.evaluate_subscription(subscription)
-            except Exception as exc:
-                logger.warning("评估订阅路由失败: %s", type(exc).__name__)
-                evaluation = {
-                    "state": "unknown",
-                    "platform_id": subscription.get("platform_id"),
-                    "bot": None,
-                }
-            state = evaluation.get("state", "no_eligible_account")
-            states.append(state)
-            resolved = evaluation.get("platform_id")
-            bot = evaluation.get("bot")
-            items.append(
-                {
-                    "group_id": subscription["group_id"],
-                    "platform_id": subscription.get("platform_id"),
-                    "self_id": subscription.get("self_id"),
-                    "resolved_platform_id": resolved,
-                    "state": state,
-                    "state_label": STATE_LABELS.get(state, "未知状态"),
-                    "will_migrate": bool(
-                        resolved
-                        and subscription.get("platform_id")
-                        and resolved != subscription.get("platform_id")
-                    ),
-                    "account_self_id": (
-                        str(getattr(bot, "self_id", "") or "") or None
-                        if bot is not None
-                        else None
-                    ),
-                    "last_delivery": plugin.status.get_delivery(
-                        subscription.get("platform_id") or resolved,
-                        subscription["group_id"],
-                    ),
-                }
-            )
-        summary = {
-            "total": len(items),
-            "ready": states.count("ready"),
-            "legacy": states.count("legacy"),
-        }
-        summary["blocked"] = summary["total"] - summary["ready"] - summary["legacy"]
+        items, summary = await _build_subscription_items(plugin)
         return json_response({"items": items, "summary": summary})
 
     async def api_events():
@@ -557,6 +579,53 @@ def register_view_apis(plugin, context) -> None:
         return json_response({"ok": True, "removed": removed, "group_id": group_id})
 
     test_cooldown: dict[str, float] = {}
+    health_cache: dict[str, Any] = {"at": 0.0, "data": None}
+    groups_cache: dict[str, dict[str, Any]] = {}
+
+    async def get_health(force: bool = False) -> dict:
+        scraper = getattr(plugin, "_scraper", None)
+        probe = getattr(scraper, "probe", None)
+        now_mono = time.monotonic()
+        if (
+            not force
+            and health_cache["data"] is not None
+            and now_mono - health_cache["at"] < 60
+        ):
+            return health_cache["data"]
+        if not callable(probe):
+            last = plugin.status.last_check
+            return {
+                "site": SITE_URL,
+                "reachable": last.get("ok") if last else None,
+                "status_code": None,
+                "latency_ms": last.get("duration_ms") if last else None,
+                "checked_at": last.get("finished_at") if last else None,
+                "error": None,
+            }
+        try:
+            data = await probe()
+        except Exception as exc:
+            data = {
+                "site": SITE_URL,
+                "reachable": False,
+                "status_code": None,
+                "latency_ms": None,
+                "checked_at": datetime.now().astimezone().isoformat(
+                    timespec="seconds"
+                ),
+                "error": type(exc).__name__,
+            }
+        health_cache["at"] = now_mono
+        health_cache["data"] = data
+        return data
+
+    async def api_health():
+        force = str(_query_get("force", "0") or "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        return json_response(await get_health(force=force))
 
     async def api_subscriptions_test():
         payload = await _json_body(default={})
@@ -626,6 +695,8 @@ def register_view_apis(plugin, context) -> None:
                 platform_id=platform_used,
                 reason=exc.reason,
                 retcode=exc.retcode,
+                action=exc.action,
+                detail=exc.detail,
             )
             plugin.status.save()
             logger.warning("测试推送失败: %s", exc.diagnostic())
@@ -659,8 +730,186 @@ def register_view_apis(plugin, context) -> None:
             }
         )
 
+    async def api_history():
+        days = int(_query_get("days", 7, int) or 7)
+        return json_response({"days": plugin.status.history(days)})
+
+    async def api_diagnostics():
+        status = await _build_status(plugin)
+        status["health"] = await get_health()
+        items, summary = await _build_subscription_items(plugin)
+        seen = plugin._load_seen()
+        seen_ids = seen.get("onlinefix", []) if isinstance(seen, dict) else []
+        if not isinstance(seen_ids, list):
+            seen_ids = []
+        return json_response(
+            {
+                "generated_at": datetime.now().astimezone().isoformat(
+                    timespec="seconds"
+                ),
+                "plugin": status["plugin"],
+                "runtime": status["runtime"],
+                "schedule": status["schedule"],
+                "last_check": status["last_check"],
+                "counts": status["counts"],
+                "config": status["config"],
+                "health": status["health"],
+                "accounts": status["accounts"],
+                "subscriptions": {"items": items, "summary": summary},
+                "history": plugin.status.history(7),
+                "events": plugin.status.events(limit=MAX_EVENT_LIMIT),
+                "seen_games": [str(item) for item in seen_ids],
+            }
+        )
+
+    async def api_maintenance_seen():
+        payload = await _json_body(default={})
+        if not isinstance(payload, dict):
+            payload = {}
+        action = str(payload.get("action") or "").strip()
+        confirm = str(payload.get("confirm") or "").strip()
+        if action not in ("reset", "clear"):
+            return error_response("action 必须是 reset 或 clear")
+        required = "RESET" if action == "reset" else "CLEAR"
+        if confirm != required:
+            return error_response(f"请输入 {required} 以确认此操作")
+
+        if action == "reset":
+            if getattr(plugin, "_scraper", None) is None:
+                return error_response("插件尚未完成初始化", status_code=503)
+            try:
+                games, _ = await plugin._scraper.fetch_list(1)
+            except Exception as exc:
+                logger.warning("重置 seen 基线失败: %s", type(exc).__name__)
+                return error_response("抓取当前游戏列表失败，请稍后重试", status_code=502)
+            ids = [game.id for game in games]
+            plugin._save_seen({"onlinefix": ids})
+            plugin.status.add_event(
+                "info",
+                "maintenance",
+                f"seen 基线已重置（{len(ids)} 款）",
+                count=len(ids),
+            )
+            plugin.status.save()
+            return json_response(
+                {
+                    "ok": True,
+                    "action": "reset",
+                    "tracked_games": len(ids),
+                    "message": f"已把当前 {len(ids)} 款游戏设为 seen 基线，不会推送",
+                }
+            )
+
+        plugin._save_seen({"onlinefix": [], "force_push_all": True})
+        plugin.status.add_event(
+            "warning",
+            "maintenance",
+            "seen 基线已清空，下次检查会推送当前全部游戏",
+        )
+        plugin.status.save()
+        return json_response(
+            {
+                "ok": True,
+                "action": "clear",
+                "tracked_games": 0,
+                "message": "seen 基线已清空；下次检查会推送当前全部游戏",
+            }
+        )
+
+    async def fetch_groups(platform_id: str) -> list[dict]:
+        cached = groups_cache.get(platform_id)
+        if cached and time.monotonic() - cached["at"] < 30:
+            return cached["items"]
+        inst = plugin._find_platform(platform_id)
+        if inst is None:
+            raise ValueError("平台未加载")
+        bot = plugin._inst_bot(inst)
+        if bot is None:
+            raise ValueError("机器人实例不可用")
+        result = await call_action(bot, "get_group_list")
+        groups = result.get("data") if isinstance(result, dict) else result
+        if not isinstance(groups, list):
+            groups = []
+        items = []
+        for item in groups:
+            if not isinstance(item, dict):
+                continue
+            group_id = _valid_group_id(item.get("group_id") or item.get("group"))
+            if group_id is None:
+                continue
+            name = str(item.get("group_name") or item.get("name") or "")[:100]
+            items.append({"group_id": group_id, "group_name": name})
+        items.sort(key=lambda item: item["group_id"])
+        groups_cache[platform_id] = {
+            "at": time.monotonic(),
+            "items": items,
+        }
+        return items
+
+    async def api_groups():
+        platform_id = str(_query_get("platform_id", "") or "").strip()
+        if not platform_id:
+            return error_response("platform_id 不能为空")
+        try:
+            items = await fetch_groups(platform_id)
+        except OneBotActionError as exc:
+            logger.warning("获取群列表失败: %s", exc.diagnostic())
+            return error_response(exc.user_message(), status_code=502)
+        except ValueError as exc:
+            return error_response(str(exc), status_code=409)
+        return json_response({"platform_id": platform_id, "items": items})
+
+    async def api_subscriptions_add():
+        payload = await _json_body(default={})
+        if not isinstance(payload, dict):
+            payload = {}
+        group_id = _valid_group_id(payload.get("group_id"))
+        platform_id = str(payload.get("platform_id") or "").strip()
+        if group_id is None:
+            return error_response("group_id 不合法")
+        if not platform_id:
+            return error_response("platform_id 不能为空")
+        try:
+            groups = await fetch_groups(platform_id)
+        except OneBotActionError as exc:
+            return error_response(exc.user_message(), status_code=502)
+        except ValueError as exc:
+            return error_response(str(exc), status_code=409)
+        if group_id not in {item["group_id"] for item in groups}:
+            return error_response("机器人不在该群，无法添加订阅", status_code=400)
+
+        evaluation = await plugin.evaluate_subscription(
+            {"group_id": group_id, "platform_id": platform_id}
+        )
+        bot = evaluation.get("bot")
+        if bot is None:
+            return error_response(
+                f"该账号当前不可推送：{STATE_LABELS.get(evaluation.get('state'), '未知状态')}",
+                status_code=409,
+            )
+        changed = await plugin.add_subscription(
+            group_id, platform_id, getattr(bot, "self_id", None)
+        )
+        return json_response(
+            {
+                "ok": True,
+                "changed": changed,
+                "group_id": group_id,
+                "platform_id": platform_id,
+                "message": "已添加订阅" if changed else "该群已订阅此账号",
+            }
+        )
+
     routes = [
         (f"/{PLUGIN_NAME}/status", api_status, ["GET"], "Get plugin status"),
+        (f"/{PLUGIN_NAME}/health", api_health, ["GET"], "Probe site health"),
+        (f"/{PLUGIN_NAME}/history", api_history, ["GET"], "Get daily history"),
+        (
+            f"/{PLUGIN_NAME}/diagnostics",
+            api_diagnostics,
+            ["GET"],
+            "Export diagnostics",
+        ),
         (
             f"/{PLUGIN_NAME}/subscriptions",
             api_subscriptions,
@@ -682,6 +931,12 @@ def register_view_apis(plugin, context) -> None:
             "Get game player counts",
         ),
         (
+            f"/{PLUGIN_NAME}/subscriptions/add",
+            api_subscriptions_add,
+            ["POST"],
+            "Add a subscription",
+        ),
+        (
             f"/{PLUGIN_NAME}/subscriptions/remove",
             api_subscriptions_remove,
             ["POST"],
@@ -692,6 +947,18 @@ def register_view_apis(plugin, context) -> None:
             api_subscriptions_test,
             ["POST"],
             "Send a test push",
+        ),
+        (
+            f"/{PLUGIN_NAME}/groups",
+            api_groups,
+            ["GET"],
+            "List groups for an account",
+        ),
+        (
+            f"/{PLUGIN_NAME}/maintenance/seen",
+            api_maintenance_seen,
+            ["POST"],
+            "Reset or clear the seen baseline",
         ),
         (f"/{PLUGIN_NAME}/check", api_check, ["POST"], "Run a check"),
     ]

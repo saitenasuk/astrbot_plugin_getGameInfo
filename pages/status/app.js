@@ -14,10 +14,13 @@ import { renderOverview } from "./pages/overview.js";
 import { renderSubscriptions } from "./pages/subscriptions.js";
 import { renderGames } from "./pages/games.js";
 import { renderEvents } from "./pages/events.js";
+import { renderMaintenance } from "./pages/maintenance.js";
 
 const initialTab = location.hash.replace(/^#/, "");
 const state = {
-  tab: ["overview", "subscriptions", "games", "events"].includes(initialTab)
+  tab: ["overview", "subscriptions", "games", "events", "maintenance"].includes(
+    initialTab,
+  )
     ? initialTab
     : "overview",
   status: null,
@@ -35,7 +38,13 @@ const state = {
   lastUpdated: null,
 };
 
-const TAB_NAMES = new Set(["overview", "subscriptions", "games", "events"]);
+const TAB_NAMES = new Set([
+  "overview",
+  "subscriptions",
+  "games",
+  "events",
+  "maintenance",
+]);
 
 function showError(message) {
   const banner = document.getElementById("error-banner");
@@ -359,8 +368,10 @@ function testPush(item) {
         renderChrome();
         if (state.tab === "events") render();
       } catch (error) {
+        await loadEvents().catch(() => {});
         showError(error.message);
         showToast(error.message, "error");
+        if (state.tab === "events" || state.tab === "maintenance") render();
       }
     },
   });
@@ -385,6 +396,281 @@ function removeSubscription(item) {
           loadEvents(),
           loadSubscriptions(),
         ]);
+        render();
+      } catch (error) {
+        showError(error.message);
+        showToast(error.message, "error");
+      }
+    },
+  });
+}
+
+function downloadJson(data, filename) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], {
+    type: "application/json",
+  });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.rel = "noopener";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function typedConfirmModal({
+  title,
+  bodyHtml,
+  required,
+  confirmText,
+  tone = "button-primary",
+  onConfirm,
+}) {
+  const overlay = openModal(
+    title,
+    `${bodyHtml}
+     <label class="field-label" for="typed-confirm-input">
+       输入 <span class="mono">${escapeHtml(required)}</span> 确认
+     </label>
+     <input class="search-input" id="typed-confirm-input"
+       autocomplete="off" spellcheck="false" />`,
+    `<button class="button" type="button" data-typed-cancel>取消</button>
+     <button class="button ${tone}" type="button" data-typed-ok disabled>
+       ${escapeHtml(confirmText)}
+     </button>`,
+  );
+  const input = overlay.querySelector("#typed-confirm-input");
+  const okButton = overlay.querySelector("[data-typed-ok]");
+  input?.addEventListener("input", () => {
+    okButton.disabled = input.value.trim() !== required;
+  });
+  overlay
+    ?.querySelector("[data-typed-cancel]")
+    ?.addEventListener("click", closeModal);
+  okButton?.addEventListener("click", async () => {
+    if (input?.value.trim() !== required) return;
+    closeModal();
+    await onConfirm();
+  });
+  window.setTimeout(() => input?.focus(), 30);
+}
+
+async function refreshAfterMutation() {
+  await Promise.allSettled([loadStatus(), loadEvents()]);
+  if (state.subscriptions) {
+    await loadSubscriptions().catch(() => {});
+  }
+  render();
+}
+
+function resetBaseline() {
+  const tracked = state.status?.counts?.tracked_games ?? 0;
+  typedConfirmModal({
+    title: "重置 seen 基线",
+    bodyHtml: `
+      <p>将抓取站点当前列表并写入 <span class="mono">seen_games.json</span>，
+      之后这些游戏不会再被当作新游戏。<strong>不会发送任何消息。</strong></p>
+      <p class="muted">当前追踪 ${escapeHtml(String(tracked))} 款。如果站点暂时异常，请不要重置。</p>`,
+    required: "RESET",
+    confirmText: "重置基线",
+    onConfirm: async () => {
+      try {
+        const result = await apiPost("maintenance/seen", {
+          action: "reset",
+          confirm: "RESET",
+        });
+        showToast(result.message || "seen 基线已重置", "success");
+        await refreshAfterMutation();
+      } catch (error) {
+        showError(error.message);
+        showToast(error.message, "error");
+      }
+    },
+  });
+}
+
+function clearBaseline() {
+  typedConfirmModal({
+    title: "清空 seen 基线",
+    bodyHtml: `
+      <p class="badge badge-danger">危险操作</p>
+      <p>清空后，下一次检查会把站点当前<strong>全部游戏</strong>当作新游戏推送，
+      可能一次发送大量消息且无法撤回。</p>
+      <p class="muted">如果只想重新记录当前列表而不推送，请使用「重置基线」。</p>`,
+    required: "CLEAR",
+    confirmText: "清空 seen",
+    tone: "button-danger",
+    onConfirm: async () => {
+      try {
+        const result = await apiPost("maintenance/seen", {
+          action: "clear",
+          confirm: "CLEAR",
+        });
+        showToast(result.message || "seen 基线已清空", "warning");
+        await refreshAfterMutation();
+      } catch (error) {
+        showError(error.message);
+        showToast(error.message, "error");
+      }
+    },
+  });
+}
+
+async function exportDiagnostics() {
+  try {
+    const data = await apiGet("diagnostics");
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[:.]/g, "-")
+      .slice(0, 19);
+    downloadJson(data, `getGameInfo-diagnostics-${stamp}.json`);
+    showToast("诊断 JSON 已导出", "success");
+  } catch (error) {
+    showError(error.message);
+    showToast(error.message, "error");
+  }
+}
+
+async function probeHealth() {
+  try {
+    const data = await apiGet("health", { force: 1 });
+    if (data.reachable) {
+      showToast(
+        `站点正常：HTTP ${data.status_code ?? "?"} · ${data.latency_ms ?? "?"} ms`,
+        "success",
+      );
+    } else {
+      showToast(
+        `站点异常：${data.error || data.status_code || "无法连接"}`,
+        "error",
+      );
+    }
+    await loadStatus();
+    render();
+  } catch (error) {
+    showError(error.message);
+    showToast(error.message, "error");
+  }
+}
+
+function openAddSubscription() {
+  const accounts = (state.status?.accounts || []).filter(
+    (account) => account.platform_id,
+  );
+  if (!accounts.length) {
+    showToast("没有可用的 OneBot 账号", "warning");
+    return;
+  }
+  let groups = [];
+  const overlay = openModal(
+    "添加订阅",
+    `<label class="field-label" for="add-account">选择机器人账号</label>
+     <select class="search-input" id="add-account">
+       ${accounts
+         .map(
+           (account) =>
+             `<option value="${escapeHtml(account.platform_id)}">${escapeHtml(
+               `${account.platform_id}${account.self_id ? ` · ${account.self_id}` : ""}`,
+             )}</option>`,
+         )
+         .join("")}
+     </select>
+     <label class="field-label" for="add-group">选择群</label>
+     <div id="add-group-wrap">
+       <div class="loading-block">正在读取群列表…</div>
+     </div>`,
+    `<button class="button" type="button" data-add-cancel>取消</button>
+     <button class="button button-primary" type="button" data-add-confirm disabled>
+       添加订阅
+     </button>`,
+  );
+  const accountSelect = overlay.querySelector("#add-account");
+  const groupWrap = overlay.querySelector("#add-group-wrap");
+  const addButton = overlay.querySelector("[data-add-confirm]");
+
+  async function loadGroupList() {
+    groups = [];
+    addButton.disabled = true;
+    groupWrap.innerHTML = '<div class="loading-block">正在读取群列表…</div>';
+    try {
+      const data = await apiGet("groups", {
+        platform_id: accountSelect.value,
+      });
+      groups = data.items || [];
+      if (!groups.length) {
+        groupWrap.innerHTML =
+          '<p class="muted">该账号没有返回群列表，请确认机器人在群内且已登录。</p>';
+        return;
+      }
+      groupWrap.innerHTML = `
+        <select class="search-input" id="add-group">
+          ${groups
+            .map(
+              (group) =>
+                `<option value="${escapeHtml(group.group_id)}">${escapeHtml(
+                  `${group.group_name || "未命名群"}（${group.group_id}）`,
+                )}</option>`,
+            )
+            .join("")}
+        </select>`;
+      addButton.disabled = false;
+    } catch (error) {
+      groupWrap.innerHTML = `<p class="badge badge-danger">${escapeHtml(
+        error.message,
+      )}</p>`;
+    }
+  }
+
+  accountSelect?.addEventListener("change", loadGroupList);
+  overlay
+    ?.querySelector("[data-add-cancel]")
+    ?.addEventListener("click", closeModal);
+  addButton?.addEventListener("click", async () => {
+    const groupSelect = groupWrap.querySelector("#add-group");
+    const groupId = groupSelect?.value;
+    if (!groupId) return;
+    addButton.disabled = true;
+    try {
+      const result = await apiPost("subscriptions/add", {
+        group_id: groupId,
+        platform_id: accountSelect.value,
+      });
+      closeModal();
+      showToast(result.message || "已添加订阅", "success");
+      await refreshAfterMutation();
+    } catch (error) {
+      addButton.disabled = false;
+      showError(error.message);
+      showToast(error.message, "error");
+    }
+  });
+  loadGroupList();
+}
+
+function retryTestPush(event) {
+  if (!event?.group_id) return;
+  const body = `
+    <p>重新向群 <span class="mono">${escapeHtml(event.group_id)}</span> 发送测试消息？</p>
+    <p class="muted">上次结果：${escapeHtml(event.message || "测试推送失败")}</p>
+    ${
+      event.detail
+        ? `<pre class="diagnostic-block">${escapeHtml(event.detail)}</pre>`
+        : ""
+    }`;
+  confirmModal({
+    title: "重试测试推送",
+    bodyHtml: body,
+    confirmText: "重试",
+    onConfirm: async () => {
+      try {
+        await apiPost("subscriptions/test", {
+          group_id: event.group_id,
+          ...(event.platform_id ? { platform_id: event.platform_id } : {}),
+        });
+        showToast("测试消息已发送", "success");
+        await loadEvents();
         render();
       } catch (error) {
         showError(error.message);
@@ -535,6 +821,12 @@ function render() {
     runPushCheck: () => runCheck("push"),
     testPush,
     removeSubscription,
+    openAddSubscription,
+    resetBaseline,
+    clearBaseline,
+    exportDiagnostics,
+    probeHealth,
+    retryTestPush,
     copy,
   };
   if (state.tab === "subscriptions") {
@@ -543,6 +835,8 @@ function render() {
     renderGames(root, state, handlers);
   } else if (state.tab === "events") {
     renderEvents(root, state, handlers);
+  } else if (state.tab === "maintenance") {
+    renderMaintenance(root, state, handlers);
   } else {
     renderOverview(root, state, handlers);
   }

@@ -13,6 +13,7 @@ class ViewAssetTests(unittest.TestCase):
         self.assertIn("./style.css", html)
         self.assertIn('type="module"', html)
         self.assertIn('id="push-check-button"', html)
+        self.assertIn('data-tab="maintenance"', html)
         for name in (
             "app.js",
             "api.js",
@@ -22,6 +23,7 @@ class ViewAssetTests(unittest.TestCase):
             "pages/subscriptions.js",
             "pages/games.js",
             "pages/events.js",
+            "pages/maintenance.js",
         ):
             self.assertTrue((VIEW / name).is_file(), name)
 
@@ -33,6 +35,8 @@ class ViewAssetTests(unittest.TestCase):
         self.assertIn("apiGet", api)
         self.assertIn("subscriptions/test", app)
         self.assertIn("subscriptions/remove", app)
+        self.assertIn("maintenance/seen", app)
+        self.assertIn("diagnostics", app)
         self.assertIn("检查并推送", app)
         self.assertNotIn("localStorage", api + app)
         self.assertNotIn("document.cookie", api + app)

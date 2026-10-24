@@ -32,6 +32,9 @@ class RuntimeStateTests(unittest.TestCase):
             self.assertTrue(loaded.last_check["ok"])
             self.assertEqual(loaded.last_check["duration_ms"], 42)
             self.assertEqual(loaded.today_counts()["checks"], 1)
+            self.assertEqual(loaded.history(1)[0]["checks"], 1)
+            self.assertEqual(loaded.history(1)[0]["avg_duration_ms"], 42)
+            self.assertTrue((Path(directory) / "history.json").is_file())
             self.assertEqual(loaded.events()[0]["message"], "群 123 推送失败")
             self.assertGreater(loaded.add_event("info", "check_ok", "续接")["id"], 0)
 

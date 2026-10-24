@@ -14,7 +14,14 @@ logger = logging.getLogger(__name__)
 MAX_EVENTS = 200
 MAX_DELIVERIES = 100
 COUNTER_RETENTION_DAYS = 7
-_COUNTER_KEYS = ("checks", "new_games", "pushes", "failures", "downgraded")
+_COUNTER_KEYS = (
+    "checks",
+    "new_games",
+    "pushes",
+    "failures",
+    "downgraded",
+    "duration_ms_total",
+)
 
 
 class CheckBusyError(RuntimeError):
@@ -121,6 +128,22 @@ class RuntimeState:
             temp.replace(path)
         except OSError as exc:
             logger.warning("保存插件状态文件失败: %s", exc)
+            return
+        try:
+            history_path = path.with_name("history.json")
+            history_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": now_local().isoformat(timespec="seconds"),
+                        "days": self.history(30),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning("保存历史文件失败: %s", exc)
 
     # ---- counters ----
 
@@ -141,6 +164,37 @@ class RuntimeState:
     def today_counts(self) -> dict[str, int]:
         bucket = self._today_bucket()
         return {name: bucket.get(name, 0) for name in _COUNTER_KEYS}
+
+    def history(self, days: int = 7) -> list[dict]:
+        """Daily counters for the last ``days`` days, oldest first."""
+        days = max(1, min(int(days), 30))
+        today = now_local().date()
+        result: list[dict] = []
+        for offset in range(days - 1, -1, -1):
+            day = (today - timedelta(days=offset)).isoformat()
+            bucket = self._counters.get(day, {})
+            checks = int(bucket.get("checks", 0))
+            pushes = int(bucket.get("pushes", 0))
+            failures = int(bucket.get("failures", 0))
+            total_duration = int(bucket.get("duration_ms_total", 0))
+            attempts = pushes + failures
+            result.append(
+                {
+                    "date": day,
+                    "checks": checks,
+                    "new_games": int(bucket.get("new_games", 0)),
+                    "pushes": pushes,
+                    "failures": failures,
+                    "downgraded": int(bucket.get("downgraded", 0)),
+                    "avg_duration_ms": (
+                        round(total_duration / checks) if checks else 0
+                    ),
+                    "success_rate": (
+                        round(pushes / attempts, 4) if attempts else None
+                    ),
+                }
+            )
+        return result
 
     # ---- events ----
 
@@ -249,6 +303,7 @@ class RuntimeState:
         bucket = self._today_bucket()
         bucket["checks"] += 1
         bucket["new_games"] += new_games
+        bucket["duration_ms_total"] += duration_ms
         if not dry_run:
             bucket["pushes"] += pushes
             bucket["failures"] += failures
@@ -310,5 +365,6 @@ class RuntimeState:
             "next_check_at": self.next_check_at,
             "last_check": self.last_check,
             "today": self.today_counts(),
+            "history": self.history(7),
         }
 

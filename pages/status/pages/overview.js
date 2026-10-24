@@ -21,10 +21,10 @@ function renderSchedule(status) {
   const health = status.health || {};
   const healthText =
     health.reachable === true
-      ? "最近检查成功"
+      ? `HTTP ${health.status_code ?? "200"}`
       : health.reachable === false
-        ? "最近检查失败"
-        : "暂无检查记录";
+        ? health.error || "无法连接"
+        : "暂无探测记录";
   const healthTone =
     health.reachable === true
       ? "success"
@@ -38,10 +38,14 @@ function renderSchedule(status) {
           <h2 class="card-title">轮询计划</h2>
           <p class="card-subtitle">按整点对齐执行，不受插件启动时间影响</p>
         </div>
-        ${pill(
-          runtime.checking ? "检查进行中" : "等待下次检查",
-          runtime.checking ? "brand" : "muted",
-        )}
+        <div class="card-actions">
+          ${pill(
+            runtime.checking ? "检查进行中" : "等待下次检查",
+            runtime.checking ? "brand" : "muted",
+          )}
+          <button class="button button-small button-ghost" type="button"
+            data-action="probe-health">检测站点</button>
+        </div>
       </div>
       <div class="schedule-big">
         <span id="next-check-time" class="schedule-time">${
@@ -59,9 +63,15 @@ function renderSchedule(status) {
         <dt>站点状态</dt>
         <dd>${badge(healthText, healthTone)}${
           health.latency_ms != null
-            ? `<span class="faint"> · 最近耗时 ${escapeHtml(
+            ? `<span class="faint"> · ${escapeHtml(
                 formatDuration(health.latency_ms),
               )}</span>`
+            : ""
+        }${
+          health.checked_at
+            ? `<div class="faint">探测于 ${escapeHtml(
+                formatDateTime(health.checked_at),
+              )}</div>`
             : ""
         }</dd>
         <dt>运行时长</dt>
@@ -187,6 +197,16 @@ function renderAccounts(status) {
                   ? "danger"
                   : "muted",
             )}
+            ${
+              account.last_delivery
+                ? `<div class="faint">最近投递 ${escapeHtml(
+                    formatDateTime(account.last_delivery.at),
+                  )} ${badge(
+                    account.last_delivery.ok ? "成功" : "失败",
+                    account.last_delivery.ok ? "success" : "danger",
+                  )}</div>`
+                : ""
+            }
           </dd>`,
           )
           .join("")}
@@ -240,6 +260,140 @@ function renderRecentEvents(status, events) {
     </section>`;
 }
 
+function renderHistory(history) {
+  const days = (history || []).slice(-7);
+  if (!days.length) return "";
+  const totalPushes = days.reduce((sum, day) => sum + (day.pushes || 0), 0);
+  const totalFailures = days.reduce((sum, day) => sum + (day.failures || 0), 0);
+  const attempts = totalPushes + totalFailures;
+  const rate = attempts ? Math.round((totalPushes / attempts) * 100) : null;
+  const maxNew = Math.max(1, ...days.map((day) => day.new_games || 0));
+  const maxDuration = Math.max(1, ...days.map((day) => day.avg_duration_ms || 0));
+  const width = 360;
+  const height = 120;
+  const padX = 26;
+  const chartBottom = height - 24;
+  const chartHeight = 74;
+  const slot = (width - padX * 2) / days.length;
+  const barWidth = Math.max(8, slot * 0.5);
+  const bars = days
+    .map((day, index) => {
+      const value = day.new_games || 0;
+      const barHeight = Math.max(2, (value / maxNew) * chartHeight);
+      const x = padX + index * slot + (slot - barWidth) / 2;
+      const y = chartBottom - barHeight;
+      return `
+        <rect class="chart-bar" x="${x.toFixed(1)}" y="${y.toFixed(1)}"
+          width="${barWidth.toFixed(1)}" height="${barHeight.toFixed(1)}" rx="3">
+          <title>${escapeHtml(day.date)}：新游戏 ${value}</title>
+        </rect>
+        <text class="chart-value" x="${(x + barWidth / 2).toFixed(1)}"
+          y="${(y - 4).toFixed(1)}" text-anchor="middle">${value || ""}</text>
+        <text class="chart-label" x="${(x + barWidth / 2).toFixed(1)}"
+          y="${height - 7}" text-anchor="middle">${escapeHtml(
+            String(day.date || "").slice(5),
+          )}</text>`;
+    })
+    .join("");
+  const points = days
+    .map((day, index) => {
+      const value = day.avg_duration_ms || 0;
+      const x = padX + index * slot + slot / 2;
+      const y = chartBottom - (value / maxDuration) * chartHeight;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+  const dots = days
+    .map((day, index) => {
+      const value = day.avg_duration_ms || 0;
+      const x = padX + index * slot + slot / 2;
+      const y = chartBottom - (value / maxDuration) * chartHeight;
+      return `<circle class="chart-dot" cx="${x.toFixed(1)}" cy="${y.toFixed(
+        1,
+      )}" r="2.5"><title>${escapeHtml(day.date)}：${value} ms</title></circle>`;
+    })
+    .join("");
+  const ratePoints = days
+    .map((day, index) => {
+      const rate = day.success_rate;
+      if (rate == null) return null;
+      const x = padX + index * slot + slot / 2;
+      const y = chartBottom - rate * chartHeight;
+      return {
+        x: x.toFixed(1),
+        y: y.toFixed(1),
+        rate: Math.round(rate * 100),
+        date: day.date,
+      };
+    })
+    .filter(Boolean);
+  const ratePolyline = ratePoints.length
+    ? `<polyline class="chart-line" points="${ratePoints
+        .map((point) => `${point.x},${point.y}`)
+        .join(" ")}" />`
+    : "";
+  const rateDots = ratePoints
+    .map(
+      (point) => `
+      <circle class="chart-dot" cx="${point.x}" cy="${point.y}" r="2.5">
+        <title>${escapeHtml(point.date)}：${point.rate}%</title>
+      </circle>
+      <text class="chart-value" x="${point.x}" y="${(
+        Number(point.y) - 5
+      ).toFixed(1)}" text-anchor="middle">${point.rate}%</text>`,
+    )
+    .join("");
+  return `
+    <section class="card history-card">
+      <div class="card-head">
+        <div>
+          <h2 class="card-title">近 7 天趋势</h2>
+          <p class="card-subtitle">每日新游戏与平均检查耗时</p>
+        </div>
+        <span class="badge ${
+          rate == null ? "badge-muted" : rate >= 90 ? "badge-success" : "badge-warning"
+        }">
+          ${rate == null ? "暂无推送" : `推送成功率 ${rate}%`}
+        </span>
+      </div>
+      <div class="trend-grid">
+        <div>
+          <div class="trend-label">每日新游戏</div>
+          <svg class="chart-svg" viewBox="0 0 ${width} ${height}" role="img"
+            aria-label="近 7 天每日新游戏">
+            <line class="chart-axis" x1="${padX}" y1="${chartBottom}"
+              x2="${width - padX / 2}" y2="${chartBottom}" />
+            ${bars}
+          </svg>
+        </div>
+        <div>
+          <div class="trend-label">平均检查耗时</div>
+          <svg class="chart-svg" viewBox="0 0 ${width} ${height}" role="img"
+            aria-label="近 7 天平均检查耗时">
+            <line class="chart-axis" x1="${padX}" y1="${chartBottom}"
+              x2="${width - padX / 2}" y2="${chartBottom}" />
+            <polyline class="chart-line" points="${points}" />
+            ${dots}
+          </svg>
+          <div class="trend-foot">峰值 ${escapeHtml(formatDuration(maxDuration))}</div>
+        </div>
+        <div>
+          <div class="trend-label">每日推送成功率</div>
+          <svg class="chart-svg" viewBox="0 0 ${width} ${height}" role="img"
+            aria-label="近 7 天每日推送成功率">
+            <line class="chart-axis" x1="${padX}" y1="${chartBottom}"
+              x2="${width - padX / 2}" y2="${chartBottom}" />
+            ${ratePolyline}
+            ${rateDots}
+          </svg>
+          <div class="trend-foot">${
+            rate == null ? "暂无推送记录" : `近 7 天 ${rate}%`
+          }</div>
+        </div>
+      </div>
+    </section>`;
+}
+
 export function renderOverview(root, state, handlers) {
   const status = state.status;
   if (!status) {
@@ -275,6 +429,7 @@ export function renderOverview(root, state, handlers) {
           </section>
         </div>
       </div>
+      ${renderHistory(status.history)}
     </div>`;
 
   root.querySelector('[data-action="refresh"]')?.addEventListener("click", () => {
@@ -294,5 +449,10 @@ export function renderOverview(root, state, handlers) {
     .querySelectorAll('[data-action="push-check"]')
     .forEach((button) =>
       button.addEventListener("click", () => handlers.runPushCheck()),
+    );
+  root
+    .querySelectorAll('[data-action="probe-health"]')
+    .forEach((button) =>
+      button.addEventListener("click", () => handlers.probeHealth()),
     );
 }
