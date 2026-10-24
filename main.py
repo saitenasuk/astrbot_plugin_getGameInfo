@@ -213,25 +213,51 @@ class GameDownPlugin(Star):
             group_id=record["group_id"],
             platform_id=platform_id,
         )
+        self.status.save()
         yield event.plain_result("已订阅新游戏推送。\n发送 /game unsubscribe 取消。")
+
+    async def remove_subscription(
+        self, group_id: str, platform_id: str | None = None
+    ) -> int:
+        """Remove one group/platform subscription. Returns the count removed."""
+        group_id = str(group_id)
+        subscriptions = self._normalize_subscriptions(
+            await self.get_kv_data("subscriptions", [])
+        )
+        if platform_id:
+            remaining = [
+                item
+                for item in subscriptions
+                if not (
+                    item["group_id"] == group_id
+                    and item.get("platform_id") == platform_id
+                )
+            ]
+        else:
+            remaining = [
+                item for item in subscriptions if item["group_id"] != group_id
+            ]
+        removed = len(subscriptions) - len(remaining)
+        if not removed:
+            return 0
+        await self.put_kv_data("subscriptions", remaining)
+        self.status.add_event(
+            "info",
+            "unsubscribe",
+            f"群 {group_id} 取消订阅",
+            group_id=group_id,
+            platform_id=platform_id,
+        )
+        self.status.save()
+        return removed
 
     async def _cmd_unsubscribe(self, event: AstrMessageEvent):
         gid = event.get_group_id()
         if not gid:
             yield event.plain_result("仅支持在群聊中操作。"); return
-        subscriptions = self._normalize_subscriptions(
-            await self.get_kv_data("subscriptions", [])
-        )
-        remaining = [item for item in subscriptions if item["group_id"] != str(gid)]
-        if len(remaining) == len(subscriptions):
+        removed = await self.remove_subscription(str(gid))
+        if not removed:
             yield event.plain_result("本群未订阅。"); return
-        await self.put_kv_data("subscriptions", remaining)
-        self.status.add_event(
-            "info",
-            "unsubscribe",
-            f"群 {gid} 取消订阅",
-            group_id=str(gid),
-        )
         yield event.plain_result("已取消新游戏推送。")
 
     # ---- 新游戏轮询 ----
@@ -371,6 +397,7 @@ class GameDownPlugin(Star):
                         f"发现 {len(new_games)} 款新游戏",
                         count=len(new_games),
                     )
+                    self.status.save()
                 return {
                     "mode": "push",
                     "ok": True,

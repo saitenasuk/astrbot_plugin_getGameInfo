@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from tests.support import FakeAdapter, FakeBot, FakeScraper, games, main
 
@@ -64,6 +64,7 @@ class ViewApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.plugin.name = "astrbot_plugin_getGameInfo"
         self.plugin._scraper = FakeScraper()
+        self.plugin._prepare_image = AsyncMock(return_value="base64://test-image")
         self.addAsyncCleanup(self.plugin.terminate)
 
     def route(self, path):
@@ -73,23 +74,22 @@ class ViewApiTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(webui, "request", FakeRequest(query=query, body=body)):
             return await self.route(path)()
 
-    def test_registers_all_read_only_routes(self):
-        self.assertEqual(
-            set(self.context.routes),
-            {
-                f"{PLUGIN_PATH}/status",
-                f"{PLUGIN_PATH}/subscriptions",
-                f"{PLUGIN_PATH}/events",
-                f"{PLUGIN_PATH}/games",
-                f"{PLUGIN_PATH}/games/search",
-                f"{PLUGIN_PATH}/games/detail",
-                f"{PLUGIN_PATH}/check",
-            },
-        )
+    def test_registers_all_routes(self):
+        expected_methods = {
+            f"{PLUGIN_PATH}/status": ["GET"],
+            f"{PLUGIN_PATH}/subscriptions": ["GET"],
+            f"{PLUGIN_PATH}/events": ["GET"],
+            f"{PLUGIN_PATH}/games": ["GET"],
+            f"{PLUGIN_PATH}/games/search": ["GET"],
+            f"{PLUGIN_PATH}/games/detail": ["GET"],
+            f"{PLUGIN_PATH}/check": ["POST"],
+            f"{PLUGIN_PATH}/subscriptions/remove": ["POST"],
+            f"{PLUGIN_PATH}/subscriptions/test": ["POST"],
+        }
+        self.assertEqual(set(self.context.routes), set(expected_methods))
         for path, item in self.context.routes.items():
             self.assertTrue(callable(item["handler"]))
-            expected = ["POST"] if path.endswith("/check") else ["GET"]
-            self.assertEqual(item["methods"], expected)
+            self.assertEqual(item["methods"], expected_methods[path])
 
     async def test_status_summary_includes_accounts_and_schedule(self):
         self.plugin.kv["subscriptions"] = [
@@ -168,10 +168,92 @@ class ViewApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.data["baseline_missing"])
         self.assertEqual(response.data["new_games"], [])
 
-    async def test_push_mode_is_rejected_in_read_only_version(self):
+    async def test_push_check_sends_to_subscribed_account(self):
+        self.plugin.kv["subscriptions"] = [
+            {"group_id": "123", "platform_id": "bot-a", "self_id": "111"},
+            {"group_id": "456", "platform_id": "bot-b", "self_id": "222"},
+        ]
+        self.plugin._scraper.results = games(1)
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            main, "get_astrbot_data_path", return_value=directory
+        ):
+            data_dir = Path(directory) / "plugin_data" / "astrbot_plugin_getGameInfo"
+            data_dir.mkdir(parents=True)
+            seen_path = data_dir / "seen_games.json"
+            seen_path.write_text(json.dumps({"onlinefix": ["old"]}))
+            response = await self.call("/check", body={"mode": "push"})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.data["pushes"], 1)
+            self.assertEqual(response.data["failures"], 0)
+            self.assertEqual(response.data["skipped"], 1)
+            self.assertEqual(
+                json.loads(seen_path.read_text())["onlinefix"], ["0"]
+            )
+        actions_a = [action for action, _ in self.bot_a.calls]
+        self.assertIn("send_group_msg", actions_a)
+        self.assertEqual(self.bot_b.calls, [])
+        self.assertFalse(self.plugin.status.last_check["dry_run"])
+
+    async def test_push_check_requires_subscriptions(self):
         response = await self.call("/check", body={"mode": "push"})
         self.assertEqual(response.status_code, 400)
-        self.assertIn("dry_run", response.data["message"])
+        self.assertIn("订阅", response.data["message"])
+
+    async def test_remove_subscription_removes_group(self):
+        self.plugin.kv["subscriptions"] = [
+            {"group_id": "123", "platform_id": "bot-a", "self_id": "111"},
+            {"group_id": "456", "platform_id": "bot-b", "self_id": "222"},
+        ]
+        response = await self.call(
+            "/subscriptions/remove", body={"group_id": "123"}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["removed"], 1)
+        self.assertEqual(
+            [item["group_id"] for item in self.plugin.kv["subscriptions"]], ["456"]
+        )
+        missing = await self.call(
+            "/subscriptions/remove", body={"group_id": "123"}
+        )
+        self.assertEqual(missing.status_code, 404)
+        self.assertTrue(
+            any(event["kind"] == "unsubscribe" for event in self.plugin.status.events())
+        )
+
+    async def test_remove_subscription_validates_group_id(self):
+        response = await self.call(
+            "/subscriptions/remove", body={"group_id": "abc"}
+        )
+        self.assertEqual(response.status_code, 400)
+
+    async def test_test_push_uses_subscribed_account(self):
+        self.plugin.kv["subscriptions"] = [
+            {"group_id": "123", "platform_id": "bot-a", "self_id": "111"}
+        ]
+        response = await self.call(
+            "/subscriptions/test", body={"group_id": "123"}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["ok"])
+        calls = [payload for action, payload in self.bot_a.calls if action == "send_group_msg"]
+        self.assertEqual(calls[0]["group_id"], 123)
+        self.assertIn("测试消息", calls[0]["message"][0]["data"]["text"])
+        self.assertTrue(
+            any(event["kind"] == "push_test" for event in self.plugin.status.events())
+        )
+
+    async def test_test_push_rejects_blocked_or_unknown_subscription(self):
+        self.plugin.kv["subscriptions"] = [
+            {"group_id": "456", "platform_id": "bot-b", "self_id": "222"}
+        ]
+        blocked = await self.call(
+            "/subscriptions/test", body={"group_id": "456"}
+        )
+        self.assertEqual(blocked.status_code, 409)
+        unknown = await self.call(
+            "/subscriptions/test", body={"group_id": "999"}
+        )
+        self.assertEqual(unknown.status_code, 404)
 
     async def test_check_returns_conflict_when_lock_is_held(self):
         await self.plugin._check_lock.acquire()

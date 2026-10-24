@@ -599,6 +599,12 @@ tr:last-child td {
   margin-bottom: 10px;
 }
 
+.row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
 /* ---- games ---- */
 
 .games-toolbar {

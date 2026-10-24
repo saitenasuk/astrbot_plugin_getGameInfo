@@ -22,6 +22,7 @@ const KIND_LABELS = {
   push_fail: "推送失败",
   push_fallback: "纯文字降级",
   push_skipped: "跳过推送",
+  push_test: "测试推送",
   subscribe: "新增订阅",
   unsubscribe: "取消订阅",
   migrate: "订阅迁移",

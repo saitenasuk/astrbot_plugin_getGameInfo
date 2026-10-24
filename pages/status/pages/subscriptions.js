@@ -56,7 +56,7 @@ export function renderSubscriptions(root, state, handlers) {
           </thead>
           <tbody>
             ${items
-              .map((item) => {
+              .map((item, index) => {
                 const resolved =
                   item.resolved_platform_id &&
                   item.resolved_platform_id !== item.platform_id
@@ -86,10 +86,27 @@ export function renderSubscriptions(root, state, handlers) {
                   </td>
                   <td>${renderDelivery(item.last_delivery)}</td>
                   <td>
-                    <button class="button button-small button-ghost" type="button"
-                      data-copy-group="${escapeHtml(item.group_id)}">
-                      复制群号
-                    </button>
+                    <div class="row-actions">
+                      <button class="button button-small button-ghost" type="button"
+                        data-copy-group="${escapeHtml(item.group_id)}">
+                        复制群号
+                      </button>
+                      <button class="button button-small" type="button"
+                        data-sub-action="test" data-index="${index}"
+                        ${
+                          ["ready", "legacy"].includes(item.state) ||
+                          (item.state === "platform_missing" &&
+                            item.resolved_platform_id)
+                            ? ""
+                            : "disabled"
+                        }>
+                        测试推送
+                      </button>
+                      <button class="button button-small button-danger" type="button"
+                        data-sub-action="remove" data-index="${index}">
+                        取消订阅
+                      </button>
+                    </div>
                   </td>
                 </tr>`;
               })
@@ -99,7 +116,8 @@ export function renderSubscriptions(root, state, handlers) {
       </div>
       <p class="muted" style="margin: 0">
         推送账号由收到 <span class="mono">/game subscribe</span> 的机器人决定；
-        「配置文件未启用本插件」表示该账号绑定的配置文件没有勾选本插件。
+        「插件未启用」表示该账号绑定的配置文件或会话规则没有允许本插件。
+        测试推送只发送一条文字消息；取消订阅会移除该群全部账号下的订阅。
       </p>
     </div>`;
 
@@ -107,5 +125,16 @@ export function renderSubscriptions(root, state, handlers) {
     button.addEventListener("click", () =>
       handlers.copy(button.getAttribute("data-copy-group")),
     );
+  });
+  root.querySelectorAll("[data-sub-action]").forEach((button) => {
+    const item = items[Number(button.getAttribute("data-index"))];
+    if (!item) return;
+    button.addEventListener("click", () => {
+      if (button.getAttribute("data-sub-action") === "test") {
+        handlers.testPush(item);
+      } else {
+        handlers.removeSubscription(item);
+      }
+    });
   });
 }

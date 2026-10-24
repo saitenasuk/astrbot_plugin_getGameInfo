@@ -43,6 +43,7 @@ except (ImportError, AttributeError):  # pragma: no cover - AstrBot 4.25 fallbac
             headers=headers,
         )
 
+from .onebot_sender import OneBotActionError, call_action
 from .status import CheckBusyError
 
 try:
@@ -54,6 +55,7 @@ PLUGIN_NAME = "astrbot_plugin_getGameInfo"
 SITE_URL = "https://online-fix.me"
 GAME_CACHE_TTL = 60.0
 MANUAL_CHECK_COOLDOWN = 10.0
+TEST_PUSH_COOLDOWN = 10.0
 MAX_LIST_LIMIT = 50
 MAX_EVENT_LIMIT = 200
 
@@ -139,6 +141,13 @@ def _astrbot_version() -> str | None:
         return str(version) if version else None
     except Exception:
         return None
+
+
+def _valid_group_id(raw: Any) -> str | None:
+    text = str(raw or "").strip()
+    if not text.isdigit() or not 1 <= len(text) <= 20:
+        return None
+    return text
 
 
 def _absolute_url(raw: str | None) -> str | None:
@@ -503,10 +512,14 @@ def register_view_apis(plugin, context) -> None:
         if not isinstance(payload, dict):
             payload = {}
         mode = str(payload.get("mode", "dry_run") or "dry_run")
-        if mode != "dry_run":
-            return error_response("当前版本仅支持 dry_run 检查", status_code=400)
+        if mode not in ("dry_run", "push"):
+            return error_response("mode 必须是 dry_run 或 push", status_code=400)
         if getattr(plugin, "_scraper", None) is None:
             return error_response("插件尚未完成初始化", status_code=503)
+        if mode == "push":
+            subscriptions = await _load_subscriptions(plugin)
+            if not subscriptions:
+                return error_response("还没有订阅群，无法推送", status_code=400)
         if plugin._check_lock.locked():
             return error_response("已有检查正在进行", status_code=409)
         now_mono = time.monotonic()
@@ -514,7 +527,9 @@ def register_view_apis(plugin, context) -> None:
             return error_response("操作过于频繁，请稍后再试", status_code=429)
         manual_cooldown["at"] = now_mono
         try:
-            result = await plugin.run_check(trigger="manual", dry_run=True)
+            result = await plugin.run_check(
+                trigger="manual", dry_run=mode == "dry_run"
+            )
         except CheckBusyError:
             return error_response("已有检查正在进行", status_code=409)
         except Exception as exc:
@@ -525,6 +540,124 @@ def register_view_apis(plugin, context) -> None:
                 str(result.get("error") or "检查失败"), status_code=502
             )
         return json_response(result)
+
+    async def api_subscriptions_remove():
+        payload = await _json_body(default={})
+        if not isinstance(payload, dict):
+            payload = {}
+        group_id = _valid_group_id(payload.get("group_id"))
+        if group_id is None:
+            return error_response("group_id 不合法")
+        platform_id = payload.get("platform_id")
+        if platform_id is not None:
+            platform_id = str(platform_id).strip() or None
+        removed = await plugin.remove_subscription(group_id, platform_id)
+        if not removed:
+            return error_response("未找到该订阅", status_code=404)
+        return json_response({"ok": True, "removed": removed, "group_id": group_id})
+
+    test_cooldown: dict[str, float] = {}
+
+    async def api_subscriptions_test():
+        payload = await _json_body(default={})
+        if not isinstance(payload, dict):
+            payload = {}
+        group_id = _valid_group_id(payload.get("group_id"))
+        if group_id is None:
+            return error_response("group_id 不合法")
+        platform_id = payload.get("platform_id")
+        if platform_id is not None:
+            platform_id = str(platform_id).strip() or None
+
+        subscriptions = await _load_subscriptions(plugin)
+        subscription = next(
+            (
+                item
+                for item in subscriptions
+                if item["group_id"] == group_id
+                and (platform_id is None or item.get("platform_id") == platform_id)
+            ),
+            None,
+        )
+        if subscription is None:
+            return error_response("未找到该订阅", status_code=404)
+
+        evaluation = await plugin.evaluate_subscription(subscription)
+        state = str(evaluation.get("state") or "unknown")
+        bot = evaluation.get("bot")
+        if bot is None:
+            return error_response(
+                f"该订阅当前不可推送：{STATE_LABELS.get(state, '未知状态')}",
+                status_code=409,
+            )
+
+        cooldown_key = f"{group_id}:{platform_id or ''}"
+        now_mono = time.monotonic()
+        if now_mono - test_cooldown.get(cooldown_key, 0.0) < TEST_PUSH_COOLDOWN:
+            return error_response("测试推送过于频繁，请稍后再试", status_code=429)
+        test_cooldown[cooldown_key] = now_mono
+
+        platform_used = evaluation.get("platform_id") or subscription.get(
+            "platform_id"
+        )
+        message = [
+            {
+                "type": "text",
+                "data": {
+                    "text": (
+                        "getGameInfo 测试消息\n\n"
+                        f"群号：{group_id}\n"
+                        f"账号：{platform_used or '未知'}\n"
+                        "如果你看到这条消息，说明该订阅的推送路由正常。"
+                    )
+                },
+            }
+        ]
+        try:
+            await call_action(
+                bot, "send_group_msg", group_id=int(group_id), message=message
+            )
+        except OneBotActionError as exc:
+            plugin.status.add_event(
+                "warning",
+                "push_test",
+                f"群 {group_id} 测试推送失败：{exc.reason}",
+                group_id=group_id,
+                platform_id=platform_used,
+                reason=exc.reason,
+                retcode=exc.retcode,
+            )
+            plugin.status.save()
+            logger.warning("测试推送失败: %s", exc.diagnostic())
+            return error_response(exc.user_message(), status_code=502)
+        except Exception as exc:
+            plugin.status.add_event(
+                "error",
+                "push_test",
+                f"群 {group_id} 测试推送异常：{type(exc).__name__}",
+                group_id=group_id,
+                platform_id=platform_used,
+            )
+            plugin.status.save()
+            logger.warning("测试推送异常: %s", type(exc).__name__)
+            return error_response("测试消息发送失败，请查看插件日志", status_code=500)
+
+        plugin.status.add_event(
+            "info",
+            "push_test",
+            f"群 {group_id} 测试推送成功",
+            group_id=group_id,
+            platform_id=platform_used,
+        )
+        plugin.status.save()
+        return json_response(
+            {
+                "ok": True,
+                "group_id": group_id,
+                "platform_id": platform_used,
+                "self_id": str(getattr(bot, "self_id", "") or "") or None,
+            }
+        )
 
     routes = [
         (f"/{PLUGIN_NAME}/status", api_status, ["GET"], "Get plugin status"),
@@ -548,7 +681,19 @@ def register_view_apis(plugin, context) -> None:
             ["GET"],
             "Get game player counts",
         ),
-        (f"/{PLUGIN_NAME}/check", api_check, ["POST"], "Run a dry-run check"),
+        (
+            f"/{PLUGIN_NAME}/subscriptions/remove",
+            api_subscriptions_remove,
+            ["POST"],
+            "Remove a subscription",
+        ),
+        (
+            f"/{PLUGIN_NAME}/subscriptions/test",
+            api_subscriptions_test,
+            ["POST"],
+            "Send a test push",
+        ),
+        (f"/{PLUGIN_NAME}/check", api_check, ["POST"], "Run a check"),
     ]
     for route, handler, methods, desc in routes:
         try:

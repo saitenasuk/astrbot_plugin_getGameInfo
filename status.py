@@ -79,16 +79,31 @@ class RuntimeState:
                 for key, value in deliveries.items()
                 if isinstance(value, dict)
             }
+        events = payload.get("events")
+        if isinstance(events, list):
+            self._events.clear()
+            for item in events[-self._events.maxlen :]:
+                if not isinstance(item, dict):
+                    continue
+                if not {"ts", "level", "kind", "message"} <= item.keys():
+                    continue
+                self._events.append(item)
+                try:
+                    self._seq = max(self._seq, int(item.get("id", 0)))
+                except (TypeError, ValueError):
+                    pass
 
     def save(self) -> None:
         path = self._storage_path
         if path is None:
             return
         try:
-            # Do not create the data directory from a status write; the first
-            # real check does that. This also keeps tests from touching disk.
             if not path.parent.is_dir():
-                return
+                # Do not create a data dir for an empty status; once there is
+                # something to show, persisting it is worth creating the dir.
+                if not (self.last_check or self._events or self._deliveries):
+                    return
+                path.parent.mkdir(parents=True, exist_ok=True)
             temp = path.with_name(path.name + ".tmp")
             temp.write_text(
                 json.dumps(
@@ -96,6 +111,7 @@ class RuntimeState:
                         "last_check": self.last_check,
                         "counters": self._counters,
                         "deliveries": self._deliveries,
+                        "events": list(self._events),
                     },
                     ensure_ascii=False,
                     indent=2,

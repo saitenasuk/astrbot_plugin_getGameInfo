@@ -12,6 +12,7 @@ class ViewAssetTests(unittest.TestCase):
         self.assertIn("./app.js", html)
         self.assertIn("./style.css", html)
         self.assertIn('type="module"', html)
+        self.assertIn('id="push-check-button"', html)
         for name in (
             "app.js",
             "api.js",
@@ -30,6 +31,9 @@ class ViewAssetTests(unittest.TestCase):
         self.assertIn("AstrBotPluginView", api)
         self.assertIn("AstrBotPluginPage", api)
         self.assertIn("apiGet", api)
+        self.assertIn("subscriptions/test", app)
+        self.assertIn("subscriptions/remove", app)
+        self.assertIn("检查并推送", app)
         self.assertNotIn("localStorage", api + app)
         self.assertNotIn("document.cookie", api + app)
 

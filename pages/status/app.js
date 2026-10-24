@@ -1,5 +1,6 @@
 import { apiGet, apiPost, ready, translate } from "./api.js";
 import {
+  closeModal,
   copyText,
   escapeHtml,
   formatDateTime,
@@ -28,6 +29,7 @@ const state = {
   eventsFilter: "all",
   eventsQuery: "",
   checking: false,
+  checkMode: null,
   countdownBase: null,
   countdownFetchedAt: 0,
   lastUpdated: null,
@@ -195,58 +197,201 @@ async function openGameDetail(game) {
   }
 }
 
-function renderCheckResult(result) {
+function renderCheckResult(result, mode = "dry_run") {
+  const parts = [];
   if (result.baseline_missing) {
-    return `
+    parts.push(`
       <div class="banner" style="margin:0 0 12px;background:var(--amber-soft);border-color:var(--amber);color:var(--amber)">
-        还没有 seen 基线。本次仅检查不会建立基线，也不会推送。
-      </div>
-      <p>下一次定时检查会先把当前列表记录为基线。</p>`;
+        还没有 seen 基线。${mode === "push" ? "本次检查只建立基线，不会推送。" : "本次仅检查不会建立基线，也不会推送。"}
+      </div>`);
   }
   const items = result.new_games || [];
-  if (!items.length) {
-    return '<p>没有发现新游戏，本次检查不会发送任何消息。</p>';
+  if (items.length) {
+    parts.push(`
+      <p>${mode === "push" ? "本次涉及" : "如果现在推送，会发送"}以下
+        <strong>${items.length}</strong> 款新游戏：</p>
+      <ul style="margin:8px 0 0;padding-left:20px">
+        ${items
+          .map(
+            (item) =>
+              `<li>${escapeHtml(item.title)} <span class="faint mono">(${escapeHtml(
+                item.id,
+              )})</span></li>`,
+          )
+          .join("")}
+      </ul>`);
+  } else if (!result.baseline_missing) {
+    parts.push("<p>没有发现新游戏。</p>");
   }
-  return `
-    <p>如果现在推送，会发送以下 <strong>${items.length}</strong> 款新游戏：</p>
-    <ul style="margin:8px 0 0;padding-left:20px">
-      ${items
-        .map(
-          (item) =>
-            `<li>${escapeHtml(item.title)} <span class="faint mono">(${escapeHtml(
-              item.id,
-            )})</span></li>`,
-        )
-        .join("")}
-    </ul>
-    <p class="muted" style="margin-top:12px">仅检查模式不会发送消息，也不会修改 seen 文件。</p>`;
+  if (mode === "push") {
+    parts.push(`
+      <div class="summary-chips" style="margin-top:12px">
+        <span class="badge badge-success">推送成功 ${result.pushes || 0}</span>
+        <span class="badge ${
+          result.failures ? "badge-danger" : "badge-muted"
+        }">推送失败 ${result.failures || 0}</span>
+        <span class="badge badge-muted">跳过 ${result.skipped || 0} 个订阅</span>
+        ${
+          result.downgraded
+            ? `<span class="badge badge-warning">纯文字降级 ${result.downgraded}</span>`
+            : ""
+        }
+      </div>`);
+    if (result.failures) {
+      parts.push(
+        '<p class="badge badge-danger" style="margin-top:10px">有群推送失败，详情见「事件」页。</p>',
+      );
+    }
+  } else {
+    parts.push(
+      '<p class="muted" style="margin-top:12px">仅检查模式不会发送消息，也不会修改 seen 文件。</p>',
+    );
+  }
+  return parts.join("");
 }
 
-async function runDryCheck() {
-  if (state.checking || state.status?.runtime?.checking) return;
-  if (!state.status?.runtime?.scraper_ready) {
-    showToast("插件尚未完成初始化，请稍后再试", "warning");
-    return;
-  }
+function confirmModal({ title, bodyHtml, confirmText = "确认", tone = "button-primary", onConfirm }) {
+  const overlay = openModal(
+    title,
+    bodyHtml,
+    `<button class="button" type="button" data-confirm-cancel>取消</button>
+     <button class="button ${tone}" type="button" data-confirm-ok>${escapeHtml(
+       confirmText,
+     )}</button>`,
+  );
+  overlay
+    ?.querySelector("[data-confirm-cancel]")
+    ?.addEventListener("click", closeModal);
+  overlay?.querySelector("[data-confirm-ok]")?.addEventListener("click", async () => {
+    closeModal();
+    await onConfirm();
+  });
+}
+
+async function executeCheck(mode) {
   state.checking = true;
+  state.checkMode = mode;
   renderChrome();
   try {
-    const result = await apiPost("check", { mode: "dry_run" });
+    const result = await apiPost("check", { mode });
+    const title = mode === "push" ? "检查并推送结果" : "仅检查结果";
     openModal(
-      "仅检查结果",
-      renderCheckResult(result),
+      title,
+      renderCheckResult(result, mode),
       '<button class="button button-primary" type="button" data-modal-close>知道了</button>',
     );
-    showToast("检查完成，未发送任何消息", "success");
+    if (mode === "push") {
+      showToast(
+        `推送完成：成功 ${result.pushes || 0}，失败 ${result.failures || 0}`,
+        result.failures ? "warning" : "success",
+      );
+    } else {
+      showToast("检查完成，未发送任何消息", "success");
+    }
     await Promise.allSettled([loadStatus(), loadEvents()]);
+    if (state.tab === "subscriptions") {
+      await loadSubscriptions().catch(() => {});
+    }
     render();
   } catch (error) {
     showError(error.message);
     showToast(error.message, "error");
   } finally {
     state.checking = false;
+    state.checkMode = null;
     renderChrome();
   }
+}
+
+async function runCheck(mode = "dry_run") {
+  if (state.checking || state.status?.runtime?.checking) return;
+  if (!state.status?.runtime?.scraper_ready) {
+    showToast("插件尚未完成初始化，请稍后再试", "warning");
+    return;
+  }
+  if (mode === "push") {
+    const count = state.status?.counts?.subscriptions || 0;
+    if (!count) {
+      showToast("还没有订阅群，无法推送", "warning");
+      return;
+    }
+    confirmModal({
+      title: "检查并推送",
+      bodyHtml: `
+        <p>将立即检查站点，并把新游戏推送到 <strong>${escapeHtml(String(count))}</strong> 个订阅群。</p>
+        <p class="muted">如果还没有 seen 基线，本次只会建立基线，不会发送消息。</p>
+        <p class="muted">推送会真实发送群消息且无法撤回，请确认后再继续。</p>`,
+      confirmText: "开始推送",
+      onConfirm: () => executeCheck("push"),
+    });
+    return;
+  }
+  await executeCheck("dry_run");
+}
+
+function runDryCheck() {
+  return runCheck("dry_run");
+}
+
+function subscriptionPayload(item) {
+  const payload = { group_id: item.group_id };
+  if (item.platform_id) payload.platform_id = item.platform_id;
+  return payload;
+}
+
+function testPush(item) {
+  confirmModal({
+    title: "测试推送",
+    bodyHtml: `
+      <p>向群 <span class="mono">${escapeHtml(item.group_id)}</span> 发送一条测试文字消息？</p>
+      <p class="muted">将使用 ${escapeHtml(
+        item.resolved_platform_id || item.platform_id || "当前机器人",
+      )} 账号发送，不会附带游戏封面。</p>`,
+    confirmText: "发送测试消息",
+    onConfirm: async () => {
+      try {
+        const result = await apiPost("subscriptions/test", subscriptionPayload(item));
+        showToast(
+          `测试消息已发送（${result.platform_id || "未知账号"}）`,
+          "success",
+        );
+        await loadEvents();
+        renderChrome();
+        if (state.tab === "events") render();
+      } catch (error) {
+        showError(error.message);
+        showToast(error.message, "error");
+      }
+    },
+  });
+}
+
+function removeSubscription(item) {
+  confirmModal({
+    title: "取消订阅",
+    bodyHtml: `
+      <p>确定取消群 <span class="mono">${escapeHtml(
+        item.group_id,
+      )}</span> 的订阅？</p>
+      <p class="muted">取消后该群不会再收到新游戏推送；如果同群还绑定了其他账号，也会一并移除。</p>`,
+    confirmText: "取消订阅",
+    tone: "button-danger",
+    onConfirm: async () => {
+      try {
+        await apiPost("subscriptions/remove", { group_id: item.group_id });
+        showToast("已取消该群订阅", "success");
+        await Promise.allSettled([
+          loadStatus(),
+          loadEvents(),
+          loadSubscriptions(),
+        ]);
+        render();
+      } catch (error) {
+        showError(error.message);
+        showToast(error.message, "error");
+      }
+    },
+  });
 }
 
 async function copy(text) {
@@ -344,11 +489,21 @@ function renderChrome() {
       .join("");
   }
 
+  const busy = state.checking || runtime?.checking;
+  const ready = Boolean(runtime?.scraper_ready);
   const checkButton = document.getElementById("check-button");
   if (checkButton) {
-    const busy = state.checking || runtime?.checking;
-    checkButton.disabled = Boolean(busy || !runtime?.scraper_ready);
-    checkButton.textContent = state.checking ? "检查中…" : "仅检查";
+    checkButton.disabled = Boolean(busy || !ready);
+    checkButton.textContent =
+      state.checking && state.checkMode === "dry_run" ? "检查中…" : "仅检查";
+  }
+  const pushButton = document.getElementById("push-check-button");
+  if (pushButton) {
+    pushButton.disabled = Boolean(busy || !ready);
+    pushButton.textContent =
+      state.checking && state.checkMode === "push"
+        ? "推送中…"
+        : "检查并推送";
   }
   const refreshButton = document.getElementById("refresh-button");
   if (refreshButton) refreshButton.disabled = false;
@@ -377,6 +532,9 @@ function render() {
     clearGameSearch,
     openGameDetail,
     runDryCheck,
+    runPushCheck: () => runCheck("push"),
+    testPush,
+    removeSubscription,
     copy,
   };
   if (state.tab === "subscriptions") {
@@ -501,6 +659,9 @@ function bindEvents() {
   document
     .getElementById("check-button")
     ?.addEventListener("click", () => runDryCheck());
+  document
+    .getElementById("push-check-button")
+    ?.addEventListener("click", () => runCheck("push"));
   window.addEventListener("hashchange", () => {
     const tab = location.hash.replace(/^#/, "");
     if (tab && tab !== state.tab) setTab(tab);

@@ -261,12 +261,16 @@ export function renderOverview(root, state, handlers) {
             <div class="card-head"><h2 class="card-title">快捷操作</h2></div>
             <div class="card-actions">
               <button class="button" type="button" data-action="refresh">刷新状态</button>
-              <button class="button button-primary" type="button" data-action="dry-check">
+              <button class="button" type="button" data-action="dry-check">
                 仅检查（不发消息）
+              </button>
+              <button class="button button-primary" type="button" data-action="push-check">
+                检查并推送
               </button>
             </div>
             <p class="muted" style="margin-bottom: 0">
-              「仅检查」只抓取站点列表并与 seen 基线对比，不发送消息、不修改 seen 文件。
+              「仅检查」只抓取列表并与 seen 基线对比，不发送消息；
+              「检查并推送」会真实向订阅群发送新游戏消息，需要二次确认。
             </p>
           </section>
         </div>
@@ -285,5 +289,10 @@ export function renderOverview(root, state, handlers) {
     .querySelectorAll('[data-action="dry-check"]')
     .forEach((button) =>
       button.addEventListener("click", () => handlers.runDryCheck()),
+    );
+  root
+    .querySelectorAll('[data-action="push-check"]')
+    .forEach((button) =>
+      button.addEventListener("click", () => handlers.runPushCheck()),
     );
 }
